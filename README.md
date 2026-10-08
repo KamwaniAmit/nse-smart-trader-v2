@@ -25,7 +25,7 @@ npm run dev:api   # API on 127.0.0.1:8787   (run in one terminal)
 npm run dev:web   # web on 127.0.0.1:5173   (run in a second terminal)
 ```
 
-Requires Node 20 or newer.
+Requires Node.js >= 22.22.2.
 
 ## Configuration
 

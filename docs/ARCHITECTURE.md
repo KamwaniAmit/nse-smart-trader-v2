@@ -32,7 +32,7 @@ Strategy and risk code never know which broker is in use. Brokers are reached on
 - `instruments` — `BrokerRef`, `InstrumentResolver`, `NotConfiguredResolver`, `assertNoSubstitution`.
 - `marketdata` — normalized quote / option leg / chain / candle types and `assessQuote`.
 - `ports` — broker-facing interfaces and `BrokerAdapter`.
-- `risk` — risk contract only (no thresholds in Phase 1A).
+- `risk` — risk contract only (no thresholds in Phase 1A). Risk is a separate output from Score and from Expected Net Edge. It may take the *quality* of Expected Net Edge as one input, but it never calculates, replaces or overrides Expected Net Edge.
 - `strategy` — LONG VOL and Best Opportunities type boundaries only.
 - `paper`, `journal` — paper-trade and journal contracts only.
 

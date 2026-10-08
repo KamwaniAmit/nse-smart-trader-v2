@@ -44,3 +44,5 @@ QUALIFIED, WATCH, FILTERED, REJECTED, DATA_INSUFFICIENT.
 ## Independence
 
 Score, Risk and Expected Net Edge are independent outputs. A high score does not imply low risk. Risk is classified by a dedicated Risk Engine (a later phase), never in the UI.
+
+Clarification (accepted decision, see `DECISIONS.md`): Expected Net Edge remains a strategy/opportunity output. Risk may use the *quality* of Expected Net Edge as one input among others, but must not calculate, replace or override Expected Net Edge, and must not be derived from Score. This clarifies Risk's inputs only; no strategy definition above is changed.

@@ -9,7 +9,8 @@ export type { RiskDataStatus, RiskFilter, RiskLevel, RiskResult };
  * CONTRACT ONLY: no thresholds, weights or classification rules exist in Phase 1A.
  * Deliberately absent: the opportunity score, the opportunity status, and
  * the capital gate result. Risk must not be derived from the opportunity score.
- * (Whether an edge-quality factor may feed Risk is an open decision: see docs/DECISIONS.md.)
+ * (Decided: the QUALITY of Expected Net Edge is an accepted Risk input. Risk must never
+ * calculate, replace or override Expected Net Edge: see docs/DECISIONS.md.)
  */
 export const RISK_INPUT_FIELDS = [
   "expectedNetEdgeQuality",

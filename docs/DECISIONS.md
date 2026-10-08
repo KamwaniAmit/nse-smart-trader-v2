@@ -1,6 +1,6 @@
-# Open Decisions
+# Decisions (open and decided)
 
-Nothing below is decided. Phase 1A deliberately avoids pre-empting any of these.
+The seven numbered decisions below are **open**. Phase 1A deliberately avoids pre-empting any of them. Decisions that have already been made are recorded under "Decided" at the end of this file.
 
 1. **Persistence / storage.** Multi-user sessions, stored broker tokens, and the journal all need durable storage, but no database or hosted storage service is approved. Phase 1A has no persistence. Must be decided before the broker-auth phase.
 2. **Hosting / server architecture.** The API is a local Express server. A hosted environment may prefer serverless functions. Handlers are plain functions to keep either option open.
@@ -12,8 +12,15 @@ Nothing below is decided. Phase 1A deliberately avoids pre-empting any of these.
 
 ## Smaller notes
 
-- **Risk inputs.** The original specification lists "Expected Net Edge quality" as a possible risk factor while also requiring Risk to be separate from Expected Net Edge. The risk-input list in core keeps that name for now; confirm in the Risk phase whether an edge-quality input is acceptable.
 - **Risk thresholds.** None exist. They must be proposed, documented and approved before any LOW/MEDIUM/HIGH classification is implemented.
 - **Best Opportunities risk filter.** The legacy filter allowed multiple selections (HIGH/MEDIUM); the new requirement is a single selection ALL/LOW/MEDIUM/HIGH. Default assumed: ALL.
 - **PWA.** Phase 1A includes a web manifest only. A service worker is deferred, because caching API responses needs a deliberate design.
 - **CORS.** The API allows only the local Vite dev origin, GET only. Revisit with the hosting decision.
+
+## Decided
+
+1. **Risk may use the quality of Expected Net Edge as an input.** `expectedNetEdgeQuality` is an accepted Risk input.
+   - Expected Net Edge remains a separate strategy/opportunity output, produced by the strategy layer.
+   - Risk may use the *quality* of Expected Net Edge as one input among others.
+   - Risk must **not** calculate, replace or override Expected Net Edge, and must not be derived from the opportunity Score.
+   - This does not add any Risk threshold or classification logic. Thresholds remain to be proposed and approved in the Risk phase.

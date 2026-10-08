@@ -81,8 +81,23 @@ dist/assets/index-Id5FKR3M.js   265.95 kB
 
 ## Not completed (by design)
 
-Phase 1B; broker connection and authentication; any market data; RV / Expected Move / Implied Move / Edge / Score / Risk calculation; persistence; deployment; GitHub upload (done by the project owner).
+Phase 1B; broker connection and authentication; any market data; RV / Expected Move / Implied Move / Edge / Score / Risk calculation; persistence; deployment.
 
-## GitHub status
+## GitHub and commit status
 
-Not pushed from this environment. The existing private repository currently holds only `.gitignore` and `package-lock.json` from the earlier tool; both are replaced by the versions in this deliverable.
+The Phase 1A foundation was committed and pushed by the project owner to the private repository (branch `main`) as commit **`fdb7ae1`** (abbreviated SHA; the full SHA is not recorded in this document). That commit replaced the `.gitignore` and `package-lock.json` created by the earlier tool and added the rest of the project (98 files changed in total).
+
+`fdb7ae1` is the Phase 1A foundation commit. The final cleanup described below is a separate, later commit. Its SHA is deliberately not written here, because a document cannot contain the hash of the commit that contains it; `git log` shows the current HEAD.
+
+## Final cleanup after the architecture audit
+
+Documentation and configuration corrections only. No behaviour, dependency, contract, market definition or test was changed; the test count is unchanged at 98.
+
+1. **Risk decision recorded.** `expectedNetEdgeQuality` is an accepted Risk input. Expected Net Edge remains a separate strategy/opportunity output; Risk may use its *quality* as one input but must not calculate, replace or override it. No Risk threshold, classification or filtering logic was added. Recorded in `DECISIONS.md` (section "Decided"), `ARCHITECTURE.md`, a clarifying sentence in `STRATEGY_FREEZE.md` (no strategy definition changed), and the comment above `RISK_INPUT_FIELDS` in `packages/core/src/risk/types.ts` (comment text only).
+2. **Node.js requirement corrected** from 20 to **Node.js >= 22.22.2**: `package.json` `engines`, the matching root entry in `package-lock.json`, and `README.md`. The earlier text said Node 20 was enough, which the test tooling does not support.
+3. **Commit status** in this report rewritten (see "GitHub and commit status" above).
+
+Re-validation after the cleanup: `npm install` exit 0 (0 vulnerabilities, no dependency added); `npm run check` exit 0 (typecheck clean, lint clean, 98 / 98 tests); `npm run test` exit 0 (98 / 98); `npm run build` exit 0. No broker API was called; the only network contact was the npm package registry during `npm install`.
+
+Still deferred, unchanged: Risk Engine classification, Risk thresholds, Risk filtering behaviour, paper-trade capture behaviour, journal persistence, FYERS integration, live market data, order execution. Phase 1B was NOT implemented.
+
