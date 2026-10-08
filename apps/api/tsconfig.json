@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "noEmit": true,
+    "paths": {
+      "@nsest/core": ["../../packages/core/src/index.ts"],
+      "@nsest/core/contracts": ["../../packages/core/src/contracts/index.ts"],
+      "@nsest/adapters": ["../../packages/adapters/src/index.ts"]
+    }
+  },
+  "include": ["src", "tests"]
+}

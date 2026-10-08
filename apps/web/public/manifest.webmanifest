@@ -1,0 +1,9 @@
+{
+  "name": "NSE Smart Trader V2",
+  "short_name": "Smart Trader V2",
+  "description": "Options research and paper-trading platform (Phase 1A foundation).",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a"
+}

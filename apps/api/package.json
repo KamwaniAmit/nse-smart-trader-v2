@@ -1,0 +1,19 @@
+{
+  "name": "@nsest/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Thin HTTP API. Phase 1A exposes /api/health and /api/markets only.",
+  "dependencies": {
+    "@nsest/adapters": "0.1.0",
+    "@nsest/core": "0.1.0",
+    "express": "^5.2.1"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -b tsconfig.build.json",
+    "test": "vitest run"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "@nsest/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Broker-independent domain contracts. Zero runtime dependencies.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "default": "./dist/index.js" },
+    "./contracts": { "types": "./dist/contracts/index.d.ts", "import": "./dist/contracts/index.js", "default": "./dist/contracts/index.js" }
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -b tsconfig.build.json",
+    "test": "vitest run"
+  }
+}

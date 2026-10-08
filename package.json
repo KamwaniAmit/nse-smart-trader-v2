@@ -1,0 +1,42 @@
+{
+  "name": "nse-smart-trader-v2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Broker-agnostic options research and paper-trading platform. Phase 1A: foundation only.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev:api": "npm run dev -w @nsest/api",
+    "dev:web": "npm run dev -w @nsest/web",
+    "typecheck": "npm run typecheck --workspaces --if-present && tsc -p tests/tsconfig.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm run test",
+    "build": "tsc -b packages/core/tsconfig.build.json packages/adapters/tsconfig.build.json apps/api/tsconfig.build.json && npm run build -w @nsest/web"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.4",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "eslint": "^10.12.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "jsdom": "^30.1.2",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.71.1",
+    "vite": "^8.3.3",
+    "vitest": "^5.0.3"
+  }
+}
