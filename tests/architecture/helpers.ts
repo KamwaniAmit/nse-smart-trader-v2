@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 export const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 
-const SKIP_DIRS = new Set(["node_modules", "dist", "coverage", ".git", ".vitest"]);
+const SKIP_DIRS = new Set(["node_modules", "dist", "coverage", ".git", ".vitest", "data"]);
 
 export function walk(dir: string, accept: (file: string) => boolean = () => true): string[] {
   if (!existsSync(dir)) return [];

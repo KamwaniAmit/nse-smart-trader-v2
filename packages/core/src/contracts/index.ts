@@ -61,3 +61,6 @@ export interface MarketSummaryDTO {
 export interface MarketsResponse {
   markets: MarketSummaryDTO[];
 }
+
+// Phase 1B contracts (additive; nothing above this line changed).
+export * from "./paperContracts.js";

@@ -8,3 +8,5 @@ coverage/
 .DS_Store
 *.log
 .vitest/
+# Paper-trade journal (Phase 1B): local runtime data, never committed.
+data/

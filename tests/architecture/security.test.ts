@@ -142,11 +142,11 @@ describe("no strategy math in Phase 1A", () => {
     expect(orderImpls.map(rel)).toEqual(["packages/adapters/src/none/DisabledOrderProvider.ts"]);
   });
 
-  it("the API exposes only the two Phase 1A GET routes", () => {
+  it("the API exposes exactly the approved routes (Phase 1A: 2 GET; Phase 1B: paper trading). See phase1b.test.ts for the full route guard", () => {
+    // Phase 1B superseded the original "only two GET routes" assertion: it scanned app.ts alone, which would
+    // have stayed green while routes lived in a router file. The exact approved list is checked there, across
+    // every file that registers routes.
     const code = stripComments(read(join(ROOT, "apps/api/src/app.ts")));
-    expect([...code.matchAll(/app\.(get|post|put|patch|delete)\(\s*"([^"]+)"/g)].map((m) => `${m[1]} ${m[2]}`)).toEqual([
-      "get /api/health",
-      "get /api/markets",
-    ]);
+    expect([...code.matchAll(/app\.(get|post|put|patch|delete)\(\s*"([^"]+)"/g)].map((m) => `${m[1]} ${m[2]}`)).toEqual(["get /api/health", "get /api/markets"]);
   });
 });

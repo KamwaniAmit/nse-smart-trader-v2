@@ -1,18 +1,25 @@
 # NSE Smart Trader V2
 
 Broker-agnostic options research and paper-trading platform.
-**Phase 1A: architecture foundation only.** There is no market data, no strategy calculation, no broker connection and no order placement in this phase.
+**Phase 1B: Risk Engine, paper trading and journal.** There is still no broker connection, no live market data and no order placement. Paper trading runs on prices you enter yourself.
 
 > The legacy Upstox/Vercel application is frozen at `FROZEN-UPSTOX-434-PASS`. V2 is a clean rebuild. No legacy code or legacy browser storage is used.
 
-## What exists in Phase 1A
+## What exists
 
-- A TypeScript npm-workspaces monorepo: `packages/core`, `packages/adapters`, `apps/api`, `apps/web`.
-- Contracts (types and interfaces) for markets, instruments, normalized market data, broker ports, risk, LONG VOL, Best Opportunities, paper trading and the journal.
-- A disabled broker adapter (`none`) and an empty placeholder for the deferred FYERS adapter.
-- An Express API with two read-only routes: `GET /api/health` and `GET /api/markets`.
-- A React/Vite shell with six pages, all clearly marked "Not available in Phase 1A" where nothing is implemented.
-- Architecture and security guard tests that scan the repository.
+**Phase 1A (frozen at tag `phase-1a-frozen`):** the monorepo, broker-independent contracts, market definitions (all `NOT_CONFIGURED`), a disabled broker adapter, the Express/React shell and the architecture guards.
+
+**Phase 1B:**
+
+- A deterministic **Risk Engine** (LOW / MEDIUM / HIGH, or unknown) with a documented rule table: `docs/RISK_ENGINE.md`.
+- **Paper trading** for LONG VOL and Best Opportunities: candidate → review → *explicit confirmation* → open → monitor → exit, with expiry and safety closure. See `docs/PAPER_TRADING.md`.
+- An immutable **entry snapshot**, entry risk kept separately from current risk, and P&L from executable bids only (`DATA_INSUFFICIENT` when a price is missing).
+- A **journal** behind a `JournalRepository` interface, with a file-backed implementation (`data/paper-journal.json`, git-ignored) and a JSON export for backups.
+- Ten paper-trading API routes under `/api/paper` (plus the two Phase 1A routes) and the web pages to use them.
+
+Paper trading is broker-independent: there are no live orders, no broker routes and no credentials.
+
+> **Persistence warning.** The file journal is for controlled development and paper-trading use. It is not guaranteed durable storage and must not be relied on on serverless or ephemeral hosting. Use the Export button regularly.
 
 ## Commands
 
@@ -40,6 +47,6 @@ adapters -> core                core -> nothing
 
 Broker names may appear only in `packages/adapters/`, `docs/` and this README. See `docs/ARCHITECTURE.md` and `docs/SECURITY.md`.
 
-## Not in this phase
+## Not built yet
 
-Broker connection or authentication, live or historical market data, RV / Expected Move / Implied Move / Edge / Score / Risk calculations, paper-trade logic, persistence, deployment, live orders. See `docs/DECISIONS.md` for the open decisions that must be settled first.
+Broker connection or authentication, live or historical market data, a scanner, calculation of Score / Expected Move / Implied Move / Expected Net Edge (they are entered, not computed), live orders, user accounts and deployment. See `docs/DECISIONS.md` for what is decided and what is still open.

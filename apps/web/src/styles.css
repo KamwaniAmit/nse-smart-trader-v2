@@ -21,3 +21,8 @@ th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #94a
 .facts dd { margin: 0; }
 [role="tab"] { padding: 0.4rem 0.9rem; margin-right: 0.3rem; cursor: pointer; }
 [role="tab"][aria-selected="true"] { font-weight: 700; text-decoration: underline; }
+fieldset { margin: 1rem 0; padding: 0.6rem 1rem; }
+fieldset .field { max-width: 24rem; }
+.riskpanel { margin: 0.4rem 0; }
+.riskpanel details { margin-top: 0.2rem; }
+[aria-selected="true"] { background: rgba(100, 116, 139, 0.15); }

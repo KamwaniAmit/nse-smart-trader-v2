@@ -3,13 +3,14 @@ import { MARKET_IDS } from "@nsest/core/contracts";
 import type { MarketId } from "@nsest/core/contracts";
 import { MarketSelector } from "../components/MarketSelector";
 import { NotAvailable } from "../components/NotAvailable";
+import { PaperCandidateWorkflow } from "../components/PaperCandidateWorkflow";
 
 export function LongVol() {
   const [market, setMarket] = useState<MarketId | "">("");
   return (
     <section>
       <h2>LONG VOL Opportunities</h2>
-      <p>LONG VOL = buy a CE and a PE (straddle or strangle).</p>
+      <p>LONG VOL = buy a CE and a PE (straddle or strangle). Entry = CE Ask + PE Ask. Exit = CE Bid + PE Bid.</p>
       <MarketSelector
         markets={MARKET_IDS}
         value={market}
@@ -17,7 +18,8 @@ export function LongVol() {
         disabled
         disabledReason="Disabled: market data is not configured."
       />
-      <NotAvailable>Scanning, scoring, edge and risk are not implemented yet.</NotAvailable>
+      <NotAvailable>Live scanning, scoring and edge need a broker, which is not connected. Enter a candidate manually below to use the paper-trading workflow.</NotAvailable>
+      <PaperCandidateWorkflow source="LONG_VOL" withRiskFilter={false} />
     </section>
   );
 }

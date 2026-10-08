@@ -8,7 +8,12 @@
 4. `LIVE_ORDERS_ENABLED` must be `false`. The server refuses to start otherwise, and the only order provider (`DisabledOrderProvider`) rejects every call with `LIVE_ORDERS_DISABLED`.
 5. The web app makes network requests only to this project's own `/api` endpoints. No other host appears anywhere in production source.
 6. No localStorage, sessionStorage or IndexedDB is used. V2 never reads the legacy `niftyAiTrader.*` browser storage.
-7. The API binds to the loopback interface and accepts cross-origin requests only from the local Vite dev origin, read-only (GET).
+7. The API binds to the loopback interface and accepts cross-origin requests (GET, POST and the preflight) only from the local Vite dev origin. Any other origin receives no CORS permission.
+8. **Phase 1B has no authentication.** It is a single-user, local tool. The API must never be exposed beyond the loopback interface.
+9. Paper-trading routes accept only `application/json`. Other content types are not parsed and are refused, and bodies over 256 KB are rejected.
+10. The paper-trade journal is local runtime data in `data/paper-journal.json`. It is git-ignored and is never committed. It holds paper-trade records only: no credentials.
+11. **The file journal is not guaranteed durable storage.** It is for controlled development and paper-trading use and must not be relied on on serverless or ephemeral hosting, where the filesystem can be discarded. The JSON export (`GET /api/paper/export`) exists for backups.
+12. There is no order, broker, login or authentication route. A guard test checks the exact list of routes.
 
 ## Planned multi-user model (not built in Phase 1A)
 
