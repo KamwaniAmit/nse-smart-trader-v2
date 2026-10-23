@@ -849,3 +849,101 @@ describe("A10 / D4: derived priceQuality (computed when read; stored records are
     }
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// M1 (review of PR #1): an open trade's unrealized P&L read at or after the contract's cutoff is a HISTORICAL snapshot.
+// Decided by the trusted server read time and the approved 15:30 IST cutoff only; no age threshold is invented.
+describe("M1: an unrealized P&L snapshot read at or after the cutoff is never labelled a current checked valuation", () => {
+  const FLAG = "UNREALIZED_SNAPSHOT_AFTER_CUTOFF";
+  const monitored = async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    const m = ok(await svc.service.monitor(id, manualAt(svc.clock.peek())));
+    return { svc, id, snapshot: m.lastMonitor };
+  };
+  const exportedRecords = async (svc: Svc) => {
+    const x = (await svc.repository.exportJournal()) as unknown as Any;
+    return JSON.stringify({ trades: x["trades"], events: x["events"] });
+  };
+
+  it("before the cutoff (15:29:59.999 IST) a checked snapshot stays MANUAL_ENTRY_CHECKED with no flag", async () => {
+    const { svc, id } = await monitored();
+    svc.clock.set(LAST_MS_BEFORE);
+    const t = view(ok(await svc.service.getTrade(id)).trade);
+    expect(t["priceQuality"]).toMatchObject({ level: "MANUAL_ENTRY_CHECKED", flags: [] });
+    expect(t["expiryStatus"]).toMatchObject({ status: "BEFORE_CUTOFF" });
+  });
+
+  it.each([["at the cutoff instant", CUTOFF], ["one ms after", FIRST_MS_AFTER], ["after the close", AFTER_CLOSE]])(
+    "%s the same snapshot is NO_PRICE with the historical-snapshot flag; the stored snapshot is unchanged",
+    async (_n, readAt) => {
+      const { svc, id, snapshot } = await monitored();
+      svc.clock.set(readAt);
+      const t = view(ok(await svc.service.getTrade(id)).trade);
+      expect(t["priceQuality"]["level"]).toBe("NO_PRICE");
+      expect(t["priceQuality"]["flags"]).toEqual([FLAG]);
+      expect(t["priceQuality"]["warnings"][0]).toMatch(/historical snapshot, not a current or executable valuation/);
+      expect(t["priceQuality"]["note"]).toContain(`recorded by the server at ${String(snapshot?.asOf)}`);
+      expect(t["priceQuality"]["note"]).toMatch(/expiry closure is unpriced/);
+      expect(t["priceQuality"]["note"]).not.toMatch(CLAIMS_VERIFICATION);
+      expect(t["expiryStatus"]).toMatchObject({ status: "EXPIRED_PENDING_CLOSURE" });
+      expect(t["lastMonitor"]).toEqual(snapshot); // the stored record is reported as it is, never rewritten
+      expect((await svc.service.listTrades())[0]?.priceQuality).toMatchObject({ level: "NO_PRICE", flags: [FLAG] });
+    },
+  );
+
+  it("the expiry closure stays unpriced: no realized P&L is calculated from the old snapshot", async () => {
+    const { svc, id, snapshot } = await monitored();
+    svc.clock.set(CUTOFF);
+    const r = ok(await svc.service.runSafetyCheck(id, manualAt(CUTOFF)));
+    expect(r.trade.state).toBe("PAPER_EXPIRED");
+    expect(r.trade.exit).toMatchObject({ basis: "NONE", exitPremium: null, valuationStatus: "DATA_INSUFFICIENT" });
+    expect(r.trade.realizedPnl).toMatchObject({ status: "DATA_INSUFFICIENT", grossPnl: null, netPnl: null });
+    expect(r.trade.exit?.staleReference?.exitPremium).toBe(snapshot?.currentExitPremium); // reference only
+    expect(view(r.trade)["priceQuality"]).toMatchObject({ level: "NO_PRICE", flags: [] }); // closed: no snapshot flag
+  });
+
+  it("the raw journal export is unchanged by reading a trade after the cutoff and never contains derived fields", async () => {
+    const { svc, id } = await monitored();
+    svc.clock.set(FIRST_MS_AFTER);
+    const before = await exportedRecords(svc);
+    ok(await svc.service.getTrade(id));
+    await svc.service.listTrades();
+    const after = await exportedRecords(svc);
+    expect(after).toBe(before);
+    expect(after).not.toMatch(/priceQuality|expiryStatus|UNREALIZED_SNAPSHOT_AFTER_CUTOFF/);
+  });
+
+  it("only the SERVER read time decides: a client time after the cutoff stored on the snapshot does not trigger the flag", () => {
+    const t = sample("journal-b91fa26.json")["pt_b91fa26-open"] as unknown as Any;
+    t["lastMonitor"]["clientAsOf"] = AFTER_CLOSE;
+    expect(assessPriceQuality(t as unknown as PaperTradeRecord, Date.parse(LAST_MS_BEFORE)).flags).not.toContain(FLAG);
+    expect(assessPriceQuality(t as unknown as PaperTradeRecord, Date.parse(CUTOFF)).flags).toContain(FLAG);
+  });
+
+  it.each([["journal-1d21f06.json", "pt_1d21f06-open"], ["journal-b91fa26.json", "pt_b91fa26-open"]])(
+    "historical %s open trade keeps its legacy flags; after the cutoff it is NO_PRICE with the snapshot flag (record not modified)",
+    (file, id) => {
+      const t = sample(file)[id] as PaperTradeRecord;
+      const stored = JSON.stringify(t);
+      const before = assessPriceQuality(t, Date.parse(LAST_MS_BEFORE));
+      expect(before.level).toBe("UNVERIFIED_LEGACY");
+      expect(before.flags).toContain("UNREALIZED_FROM_UNCHECKED_MONITOR");
+      expect(before.flags).not.toContain(FLAG);
+      const after = assessPriceQuality(t, Date.parse(CUTOFF));
+      expect(after.level).toBe("NO_PRICE");
+      expect(after.flags).toEqual([...before.flags, FLAG]);
+      expect(after.warnings).toHaveLength(after.flags.length);
+      for (const text of [after.note, ...after.warnings]) expect(text).not.toMatch(CLAIMS_VERIFICATION);
+      expect(JSON.stringify(t)).toBe(stored);
+      expect(assessPriceQuality(t)).toEqual(assessPriceQuality(JSON.parse(stored) as PaperTradeRecord)); // no read time: record-only, unchanged
+    },
+  );
+
+  it("closed historical records are not given the snapshot flag (it applies to open trades only)", () => {
+    for (const t of allSampleTrades().filter((x) => x.state !== "PAPER_OPEN")) {
+      expect(assessPriceQuality(t, Date.parse(AFTER_CLOSE)).flags).not.toContain(FLAG);
+      expect(assessPriceQuality(t, Date.parse(AFTER_CLOSE))).toEqual(assessPriceQuality(t));
+    }
+  });
+});

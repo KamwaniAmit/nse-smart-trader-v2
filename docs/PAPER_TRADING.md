@@ -151,7 +151,10 @@ stored record each time it is read and are **never written to the journal** (A10
   - `UNVERIFIED_LEGACY`: the P&L comes from prices the current rules did not check (older records), or the record's provenance is incomplete
     (`PROVENANCE_INCOMPLETE`) or does not satisfy the rules (`PROVENANCE_INCONSISTENT`). Ambiguous records are never upgraded.
   - `SUPERSEDED_RULE`: the P&L was produced by a rule that is no longer allowed (an earlier monitored bid, bids typed at expiry, or an action at or after the cutoff).
-  - `NO_PRICE`: there is no valid P&L.
+  - `NO_PRICE`: there is no valid P&L, **or** (M1) the trade is still open and is read at or after its contract's cutoff. Then the
+    unrealized P&L is flagged `UNREALIZED_SNAPSHOT_AFTER_CUTOFF`: it is a historical snapshot recorded by the server before the cutoff,
+    not a current or executable valuation, and the UI labels it that way. This is decided by the **server** read time and the approved
+    15:30 IST cutoff only (never a client time). No age limit is applied before the cutoff: no stale-age threshold has been approved.
 - `expiryStatus`: `{ status, cutoff }`, where status is `BEFORE_CUTOFF`, `EXPIRED_REVIEW` (a review that can no longer be confirmed; it stays `PAPER_REVIEW`, A7),
   `EXPIRED_PENDING_CLOSURE` (open past the cutoff; run the safety check) or `CLOSED`.
 

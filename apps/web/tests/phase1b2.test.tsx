@@ -192,3 +192,32 @@ describe("A10: price quality is visible in the list and the detail", () => {
     expect(await screen.findByText(/recorded 2026-09-28T11:00:00Z/)).toBeInTheDocument();
   });
 });
+
+describe("M1: an unrealized P&L read after the cutoff is shown as a historical snapshot, never a current valuation", () => {
+  const T = "2026-10-05T05:00:00.000Z";
+  const monitored = (pq: Any, status: string) =>
+    withView(makeTrade("PAPER_OPEN", {
+      tradeId: "pt_snap",
+      lastMonitor: { asOf: T, legs: [], dataStatus: "VALID", dataReasons: [], currentExitPremium: 120.05, unrealized: pnl, currentRisk: risk("LOW"), carriedFromEntry: [] },
+    }), { priceQuality: pq, expiryStatus: { status, cutoff: "2026-10-06T15:30:00+05:30" } });
+
+  it("with the server's UNREALIZED_SNAPSHOT_AFTER_CUTOFF flag: labelled historical, 'at that time', and the list says so", async () => {
+    await show(monitored({
+      level: "NO_PRICE",
+      flags: ["UNREALIZED_SNAPSHOT_AFTER_CUTOFF"],
+      warnings: ["The contract has reached its provisional 15:30 IST paper-safety cutoff. The unrealized P&L shown is a historical snapshot, not a current or executable valuation."],
+      note: `There is no current price: … recorded by the server at ${T} …`,
+    }, "EXPIRED_PENDING_CLOSURE"));
+    expect(await screen.findByText(/Unrealized P&L \(historical snapshot from before the expiry cutoff; not a current or executable valuation\)/)).toBeInTheDocument();
+    expect(screen.getByText(/Exit premium at that time/)).toBeInTheDocument();
+    expect(screen.queryByText(/Exit premium now/)).toBeNull();
+    expect(screen.getByText(/historical snapshot \(before expiry cutoff\); not a current valuation/)).toBeInTheDocument();
+    expect(document.querySelector('[data-price-quality="NO_PRICE"]')).not.toBeNull();
+  });
+
+  it("without the flag (before the cutoff) the existing wording is unchanged", async () => {
+    await show(monitored({ level: "MANUAL_ENTRY_CHECKED", flags: [], warnings: [], note: "Valued from prices entered manually." }, "BEFORE_CUTOFF"));
+    expect(await screen.findByText(/Exit premium now/)).toBeInTheDocument();
+    expect(screen.queryByText(/historical snapshot/)).toBeNull();
+  });
+});

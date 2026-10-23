@@ -430,6 +430,8 @@ export const PRICE_QUALITY_FLAGS = [
   "ACTION_AFTER_EXPIRY_CUTOFF",
   "PROVENANCE_INCOMPLETE",
   "PROVENANCE_INCONSISTENT",
+  // M1 (derived when read): an open trade's unrealized P&L is a snapshot from before the cutoff; read at or after it.
+  "UNREALIZED_SNAPSHOT_AFTER_CUTOFF",
 ] as const;
 export type PriceQualityFlag = (typeof PRICE_QUALITY_FLAGS)[number];
 /**

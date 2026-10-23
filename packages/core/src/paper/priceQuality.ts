@@ -1,5 +1,5 @@
 import type { ExitLegPrice, PaperPnl, PaperTradeRecord, PriceQualityDTO, PriceQualityFlag, PriceQualityLevel } from "../contracts/index.js";
-import { expiryCutoffMs } from "./safety.js";
+import { expiryCutoffInstant, expiryCutoffMs } from "./safety.js";
 import { TIME_RULES, parseStrictTimestamp } from "./time.js";
 
 /**
@@ -21,7 +21,14 @@ const WARNINGS: Readonly<Record<PriceQualityFlag, string>> = {
   ACTION_AFTER_EXPIRY_CUTOFF: "The trade was opened or exited at or after the contract's 15:30 IST paper-safety cutoff. This is no longer allowed.",
   PROVENANCE_INCOMPLETE: "The record claims checked manual prices, but the entry times, ask or provenance needed to show that are missing.",
   PROVENANCE_INCONSISTENT: "The record claims checked manual prices, but its recorded values do not satisfy the manual-input rules.",
+  UNREALIZED_SNAPSHOT_AFTER_CUTOFF:
+    "The contract has reached its provisional 15:30 IST paper-safety cutoff. The unrealized P&L shown is a historical snapshot, not a current or executable valuation.",
 };
+
+/** M1: the note when an open trade is read at or after its cutoff. `recordedAt` is the server time of the snapshot. */
+const afterCutoffNote = (recordedAt: string, cutoff: string): string =>
+  `There is no current price: the contract reached its provisional paper-safety cutoff (${cutoff}). The unrealized P&L shown was recorded by the server at ${recordedAt} ` +
+  "and is a historical snapshot only, not a current or executable valuation. Run the safety check: the expiry closure is unpriced (no approved settlement-price source).";
 
 const NOTES: Readonly<Record<PriceQualityLevel, string>> = {
   MANUAL_ENTRY_CHECKED:
@@ -51,7 +58,12 @@ const safeCutoffMs = (expiry: string): number | null => {
   }
 };
 
-export function assessPriceQuality(trade: PaperTradeRecord): PriceQualityDTO {
+/**
+ * @param nowMs The trusted SERVER time of the read (M1). When given, an open trade read at or after its contract's cutoff
+ *   is flagged UNREALIZED_SNAPSHOT_AFTER_CUTOFF and its level is NO_PRICE. Client-supplied times are never used for this.
+ *   When omitted, the result depends on the stored record only (unchanged Phase 1B.2 behaviour).
+ */
+export function assessPriceQuality(trade: PaperTradeRecord, nowMs?: number): PriceQualityDTO {
   const flags: PriceQualityFlag[] = [];
   const add = (f: PriceQualityFlag): void => {
     if (!flags.includes(f)) flags.push(f);
@@ -88,13 +100,17 @@ export function assessPriceQuality(trade: PaperTradeRecord): PriceQualityDTO {
     const lm = trade.lastMonitor;
     const checked = lm.priceProvenance === "MANUAL_USER_ENTRY" && lm.legs.length > 0 && lm.legs.every((l) => typeof l.enteredAt === "string" && typeof l.entryAgeMs === "number");
     if (pnl.status === "VALID" && !checked) add("UNREALIZED_FROM_UNCHECKED_MONITOR");
+    // M1: decided by the server read time and the approved cutoff only. No age threshold is applied before the cutoff.
+    if (pnl.status === "VALID" && nowMs !== undefined && Number.isFinite(nowMs) && cutoffMs !== null && nowMs >= cutoffMs) add("UNREALIZED_SNAPSHOT_AFTER_CUTOFF");
   }
 
   let level: PriceQualityLevel;
-  if (pnl === null || pnl.status !== "VALID") level = "NO_PRICE";
+  const afterCutoff = flags.includes("UNREALIZED_SNAPSHOT_AFTER_CUTOFF");
+  if (pnl === null || pnl.status !== "VALID" || afterCutoff) level = "NO_PRICE";
   else if (flags.some((f) => f === "PRICED_FROM_EARLIER_MONITOR_BID" || f === "EXPIRY_PRICED_FROM_TYPED_BIDS" || f === "ACTION_AFTER_EXPIRY_CUTOFF")) level = "SUPERSEDED_RULE";
   else if (flags.some((f) => f !== "SESSION_COUNT_USER_PROVIDED")) level = "UNVERIFIED_LEGACY";
   else level = "MANUAL_ENTRY_CHECKED";
 
-  return { level, flags, warnings: flags.map((f) => WARNINGS[f]), note: NOTES[level] };
+  const note = afterCutoff && trade.lastMonitor !== null ? afterCutoffNote(trade.lastMonitor.asOf, expiryCutoffInstant(trade.candidate.expiry)) : NOTES[level];
+  return { level, flags, warnings: flags.map((f) => WARNINGS[f]), note };
 }

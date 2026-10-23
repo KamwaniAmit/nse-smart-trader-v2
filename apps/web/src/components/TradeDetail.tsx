@@ -65,6 +65,8 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
 
   const costs: ExtraField = { key: "exitCosts", label: "Exit costs (₹, optional)" };
   const quality = trade.priceQuality;
+  /** M1: the server says the unrealized P&L is a snapshot from before the contract's cutoff. */
+  const historicalSnapshot = quality?.flags.includes("UNREALIZED_SNAPSHOT_AFTER_CUTOFF") ?? false;
   const expiryStatus = trade.expiryStatus?.status;
   const exit = trade.exit;
   const manualChecked = exit?.valuationStatus === "MANUAL_ENTRY_CHECKED";
@@ -135,8 +137,8 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
       {trade.state === "PAPER_OPEN" ? (
         trade.lastMonitor ? (
           <>
-            <PnlLine label="Unrealized P&L" pnl={trade.lastMonitor.unrealized} />
-            <p className="hint">Recorded by the server at {trade.lastMonitor.asOf} (processing time; these quotes carry no observation time). Exit premium now {inr(trade.lastMonitor.currentExitPremium)} (sum of bids). {trade.lastMonitor.dataReasons.join("; ")}</p>
+            <PnlLine label={historicalSnapshot ? "Unrealized P&L (historical snapshot from before the expiry cutoff; not a current or executable valuation)" : "Unrealized P&L"} pnl={trade.lastMonitor.unrealized} />
+            <p className="hint">Recorded by the server at {trade.lastMonitor.asOf} (processing time; these quotes carry no observation time). Exit premium {historicalSnapshot ? "at that time" : "now"} {inr(trade.lastMonitor.currentExitPremium)} (sum of bids). {trade.lastMonitor.dataReasons.join("; ")}</p>
           </>
         ) : (
           <p>Not monitored yet: no executable bids have been recorded.</p>

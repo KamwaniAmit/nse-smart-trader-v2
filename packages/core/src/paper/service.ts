@@ -153,7 +153,7 @@ function expiryStatusOf(trade: PaperTradeRecord, nowMs: number): ExpiryStatusDTO
 }
 
 /** A trade as returned by the service: the stored record plus derived fields. The record itself is never changed. */
-const toView = (trade: PaperTradeRecord, nowMs: number): PaperTradeView => ({ ...trade, priceQuality: assessPriceQuality(trade), expiryStatus: expiryStatusOf(trade, nowMs) });
+const toView = (trade: PaperTradeRecord, nowMs: number): PaperTradeView => ({ ...trade, priceQuality: assessPriceQuality(trade, nowMs), expiryStatus: expiryStatusOf(trade, nowMs) });
 
 /** Phase 1B.2 (A3, A6, A12): the message for an action refused at or after the cutoff. */
 const expiredMessage = (expiry: string, action: string): string =>
