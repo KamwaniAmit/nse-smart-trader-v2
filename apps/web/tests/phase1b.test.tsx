@@ -352,7 +352,10 @@ describe("Paper Trading: history, journal, export", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Journal" }));
     expect(await screen.findByText("REVIEW_STARTED")).toBeInTheDocument();
     const link = screen.getByRole("link", { name: /Export journal/ });
-    expect(link.getAttribute("href")).toBe("/api/paper/export");
+    // The export link uses the same API base as every other request (VITE_API_BASE_URL, empty = same origin).
+    // That base comes from the environment (for example a local apps/web/.env), so the expectation follows it.
+    // Both configurations are pinned deterministically in "journal export URL" below.
+    expect(link.getAttribute("href")).toBe(`${import.meta.env.VITE_API_BASE_URL ?? ""}/api/paper/export`);
     expect(link).toHaveAttribute("download");
     expect(screen.getByText(/NOT guaranteed durable storage/)).toBeInTheDocument();
   });
@@ -362,5 +365,30 @@ describe("Paper Trading: history, journal, export", () => {
     at("/paper-trading");
     fireEvent.click(screen.getByRole("tab", { name: "Archived (Legacy)" }));
     expect(screen.getByText(/does not import or read any legacy trade records/)).toBeInTheDocument();
+  });
+});
+
+// The API base is read once, when apiClient is first imported. Each case therefore stubs the variable, resets the module
+// registry and imports a fresh copy, so the result does not depend on any local .env file. afterEach restores the
+// environment and the module registry even when an assertion fails.
+describe("journal export URL follows the configured API base (exportUrl)", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  const exportUrlWithBase = async (base: string): Promise<string> => {
+    vi.resetModules();
+    vi.stubEnv("VITE_API_BASE_URL", base);
+    const { exportUrl } = await import("../src/apiClient");
+    return exportUrl();
+  };
+
+  it("an absolute base (local development: API on its own port) gives an absolute export URL", async () => {
+    expect(await exportUrlWithBase("http://127.0.0.1:8787")).toBe("http://127.0.0.1:8787/api/paper/export");
+  });
+
+  it("an empty base (same-origin deployment) gives the relative export URL", async () => {
+    expect(await exportUrlWithBase("")).toBe("/api/paper/export");
   });
 });
