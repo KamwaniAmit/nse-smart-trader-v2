@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryJournalRepository, JournalRepositoryError, JournalState, emptyJournalState, validateJournalState } from "../src/index.js";
 import type { JournalStateData, NewJournalEvent, PaperTradeRecord } from "../src/index.js";
-import { confirmBody, exitQuotes, longVolRaw, makeService } from "./fixtures.js";
+import { confirmBody, atEntryTime, exitQuotes, longVolRaw, makeService } from "./fixtures.js";
 
 /** A real PAPER_REVIEW record, produced by the service, to feed the journal rules directly. */
 async function sampleTrade(over: Record<string, unknown> = {}): Promise<PaperTradeRecord> {
@@ -100,7 +100,7 @@ describe("journal: update lifecycle and append events", () => {
     const r = await svc.service.beginReview(longVolRaw());
     if (!r.ok) throw new Error("x");
     await svc.service.confirm(r.value.tradeId, confirmBody(svc));
-    await svc.service.exit(r.value.tradeId, exitQuotes());
+    await svc.service.exit(r.value.tradeId, atEntryTime(exitQuotes(), svc.clock.peek()));
     await expect(svc.repository.updateLifecycle(r.value.tradeId, { updatedAt: "z" }, { timestamp: "z", type: "MONITOR_SNAPSHOT", tradeId: r.value.tradeId, fromState: "PAPER_EXITED", toState: "PAPER_EXITED" })).rejects.toMatchObject({ code: "INVALID_TRANSITION" });
   });
   it("updating an unknown trade is TRADE_NOT_FOUND", () => {

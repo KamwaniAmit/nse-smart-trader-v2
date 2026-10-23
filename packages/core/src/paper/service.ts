@@ -1,6 +1,7 @@
 import type {
   AssessResponseDTO,
   EntryQuoteDTO,
+  ExpiryStatusDTO,
   JournalEventRecord,
   JournalExport,
   LastValidExit,
@@ -13,11 +14,13 @@ import type {
   PaperMonitorSnapshot,
   PaperReview,
   PaperTradeRecord,
+  PaperTradeView,
   RiskFilter,
+  SafetyCheckRequestDTO,
   SafetyCheckResponseDTO,
+  ValuationRuleRecord,
 } from "../contracts/index.js";
 import { JournalRepositoryError } from "../journal/repository.js";
-import { assessQuote } from "../marketdata/assessQuote.js";
 import type { JournalRepository } from "../journal/repository.js";
 import { filterByRisk } from "../risk/filter.js";
 import { deepFreeze } from "./freeze.js";
@@ -30,10 +33,13 @@ import {
   parseSafetyCheckRequest,
 } from "./parse.js";
 import type { ParseResult } from "./parse.js";
-import { assessEntry, computeCapital, computePnl, exitPremiumOf, legLabel, resolveLegBids } from "./pricing.js";
+import { assessEntry, computeCapital, computePnl, exitPremiumOf, legLabel } from "./pricing.js";
+import { assessPriceQuality } from "./priceQuality.js";
+import { foreignQuoteReasons, resolveTimedQuotes } from "./quoteValidation.js";
+import type { TimedLegQuote, TimedQuotesResult } from "./quoteValidation.js";
 import { assessRiskRecord, buildRiskInputs } from "./riskInputs.js";
-import { evaluateSafety } from "./safety.js";
-import { TIME_RULES, checkEventTime, parseStrictTimestamp } from "./time.js";
+import { EXPIRY_CUTOFF, evaluateSafety, expiryCutoffInstant, isAtOrPastExpiryCutoff } from "./safety.js";
+import { TIME_RULES, checkEventTime } from "./time.js";
 
 export interface PaperTradingDeps {
   repository: JournalRepository;
@@ -89,11 +95,14 @@ function missingMarketData(candidate: PaperCandidate): string[] {
   return missing;
 }
 
-const sameInstrument = (a: { provider: string; id: string }, b: { provider: string; id: string }): boolean => a.provider === b.provider && a.id === b.id;
-
-/** Every field of an entry quote that affects the accepted quote or the entry snapshot. Absent and null are the same. */
+/** Every field of a quote that affects the accepted quote or a snapshot. Absent and null are the same. Equal = identical copy. */
 const entryQuoteKey = (q: EntryQuoteDTO): string =>
   JSON.stringify([q.bid ?? null, q.ask ?? null, q.ltp ?? null, q.bidQty ?? null, q.askQty ?? null, q.volume ?? null, q.oi ?? null, q.asOf ?? null]);
+
+/** The quote as stored on a leg (missing fields are null, never guessed). */
+const toPaperQuote = (q: EntryQuoteDTO): PaperLeg["quote"] => ({
+  bid: q.bid, ask: q.ask ?? null, ltp: q.ltp ?? null, bidQty: q.bidQty ?? null, askQty: q.askQty ?? null, volume: q.volume ?? null, oi: q.oi ?? null,
+});
 
 interface FreshLeg extends PaperLeg {
   quoteAsOf: string;
@@ -105,56 +114,51 @@ type FreshQuotesResult = { ok: true; legs: FreshLeg[] } | { ok: false; code: "IN
  * Phase 1B.1 (D1). Validates the fresh entry quotes sent with a confirmation, against the TRUSTED server clock:
  *  - one quote per leg, for the EXACT stored instrument (another strike, expiry or instrument is refused, never used);
  *  - an executable bid AND ask (LTP, theoretical or review-time prices are never substituted);
- *  - a quote time that is a full timestamp with a zone, not later than server time + allowed skew, and not older
- *    than TIME_RULES.maxQuoteAgeMs (60 s).
- * Wrong instruments are an INVALID_REQUEST; missing or non-executable prices are DATA_INSUFFICIENT; a missing, invalid,
- * stale or future quote time is QUOTE_NOT_FRESH.
+ *  - a quote time that is a full timestamp with a zone, not later than server time + the client-clock tolerance, and not
+ *    older than TIME_RULES.maxQuoteAgeMs (60 s).
+ * Since Phase 1B.2 this is the shared resolveTimedQuotes (also used for monitor, exit and holding-limit prices).
  */
 export function resolveFreshEntryQuotes(legs: readonly PaperLeg[], quotes: readonly EntryQuoteDTO[] | undefined, nowMs: number): FreshQuotesResult {
   if (quotes === undefined || quotes.length === 0) {
     return { ok: false, code: "DATA_INSUFFICIENT", reasons: ["Fresh executable quotes (bid, ask and quote time) are required for every leg. Review-time prices are never reused."] };
   }
-  const foreign = quotes.filter((q) => !legs.some((l) => sameInstrument(l.instrument, q.instrument)));
-  if (foreign.length > 0) {
-    return { ok: false, code: "INVALID_REQUEST", reasons: foreign.map((q) => `${q.instrument.id}: not a leg of this trade (another strike, expiry or instrument is never substituted)`) };
-  }
-  const priceReasons: string[] = [];
-  const timeReasons: string[] = [];
-  const fresh: FreshLeg[] = [];
-  for (const leg of legs) {
-    const label = legLabel(leg);
-    const matches = quotes.filter((q) => sameInstrument(q.instrument, leg.instrument));
-    if (matches.length === 0) {
-      priceReasons.push(`${label}: no fresh quote supplied for this exact instrument`);
-      continue;
-    }
-    // Review correction R3: duplicates must agree on EVERY field that feeds the accepted quote and the entry snapshot
-    // (prices, LTP, depth, volume, OI and time). Any disagreement is ambiguous; the first copy is never picked.
-    if (new Set(matches.map(entryQuoteKey)).size > 1) {
-      priceReasons.push(`${label}: conflicting quotes supplied; ambiguous, so not used`);
-      continue;
-    }
-    const q = matches[0] as EntryQuoteDTO;
-    const verdict = assessQuote({ bid: q.bid, ask: q.ask ?? null });
-    if (!verdict.executable) priceReasons.push(`${label}: ${verdict.reason} (LTP and theoretical prices are never used)`);
-    const ms = q.asOf === undefined ? null : parseStrictTimestamp(q.asOf);
-    if (q.asOf === undefined) timeReasons.push(`${label}: the quote has no time (asOf); its freshness cannot be checked`);
-    else if (ms === null) timeReasons.push(`${label}: quote time "${q.asOf}" must be a full timestamp with a zone`);
-    else if (ms > nowMs + TIME_RULES.maxFutureSkewMs) timeReasons.push(`${label}: quote time ${q.asOf} is in the future (server time ${new Date(nowMs).toISOString()})`);
-    else if (nowMs - ms > TIME_RULES.maxQuoteAgeMs) timeReasons.push(`${label}: quote is older than ${TIME_RULES.maxQuoteAgeMs / 1000} s (quote time ${q.asOf}, age ${Math.round((nowMs - ms) / 1000)} s)`);
-    if (verdict.executable && ms !== null) {
-      fresh.push({
-        ...leg,
-        quote: { bid: q.bid, ask: q.ask ?? null, ltp: q.ltp ?? null, bidQty: q.bidQty ?? null, askQty: q.askQty ?? null, volume: q.volume ?? null, oi: q.oi ?? null },
-        quoteAsOf: q.asOf as string,
-        quoteAgeMs: nowMs - ms,
-      });
-    }
-  }
-  if (priceReasons.length > 0) return { ok: false, code: "DATA_INSUFFICIENT", reasons: [...priceReasons, ...timeReasons] };
-  if (timeReasons.length > 0) return { ok: false, code: "QUOTE_NOT_FRESH", reasons: timeReasons };
-  return { ok: true, legs: fresh };
+  const r = resolveTimedQuotes(legs, quotes, nowMs, { maxAgeMs: TIME_RULES.maxQuoteAgeMs, noun: "quote", key: entryQuoteKey });
+  if (!r.ok) return { ok: false, code: r.code, reasons: r.reasons };
+  return { ok: true, legs: r.legs.map((t) => ({ ...t.leg, quote: toPaperQuote(t.quote), quoteAsOf: t.enteredAt, quoteAgeMs: t.entryAgeMs })) };
 }
+
+/** Phase 1B.2: validates MANUAL monitor / exit / holding-limit prices (same rule as entry; 60 s since manual entry). */
+const resolveManualPrices = (legs: readonly PaperLeg[], quotes: readonly EntryQuoteDTO[], nowMs: number): TimedQuotesResult =>
+  resolveTimedQuotes(legs, quotes, nowMs, { maxAgeMs: TIME_RULES.maxManualPriceAgeMs, noun: "manual price", key: entryQuoteKey });
+
+/** The rule values recorded with a manual valuation (Phase 1B.2). */
+const valuationRuleAt = (expiry: string, evaluatedAt: string): ValuationRuleRecord => ({
+  maxManualPriceAgeMs: TIME_RULES.maxManualPriceAgeMs,
+  maxFutureSkewMs: TIME_RULES.maxFutureSkewMs,
+  expiryCutoff: expiryCutoffInstant(expiry),
+  evaluatedAt,
+});
+
+/** Exit-leg prices from validated manual quotes: bid, ask, when typed and how old (Phase 1B.2). */
+const checkedLegPrices = (timed: readonly TimedLegQuote[]) =>
+  timed.map((t) => ({ instrument: t.leg.instrument, bid: t.quote.bid, ask: t.quote.ask ?? null, enteredAt: t.enteredAt, entryAgeMs: t.entryAgeMs }));
+
+/** Phase 1B.2 (A7, D3): derived, never stored. Where the trade stands relative to its contract's provisional cutoff. */
+function expiryStatusOf(trade: PaperTradeRecord, nowMs: number): ExpiryStatusDTO {
+  const cutoff = expiryCutoffInstant(trade.candidate.expiry);
+  const past = isAtOrPastExpiryCutoff(trade.candidate.expiry, nowMs);
+  if (trade.state === "PAPER_REVIEW") return { status: past ? "EXPIRED_REVIEW" : "BEFORE_CUTOFF", cutoff };
+  if (trade.state === "PAPER_OPEN") return { status: past ? "EXPIRED_PENDING_CLOSURE" : "BEFORE_CUTOFF", cutoff };
+  return { status: "CLOSED", cutoff };
+}
+
+/** A trade as returned by the service: the stored record plus derived fields. The record itself is never changed. */
+const toView = (trade: PaperTradeRecord, nowMs: number): PaperTradeView => ({ ...trade, priceQuality: assessPriceQuality(trade), expiryStatus: expiryStatusOf(trade, nowMs) });
+
+/** Phase 1B.2 (A3, A6, A12): the message for an action refused at or after the cutoff. */
+const expiredMessage = (expiry: string, action: string): string =>
+  `${action} is not allowed: contract ${expiry} reached its provisional paper-safety cutoff (${EXPIRY_CUTOFF.localTime} IST on ${expiry}). ` +
+  "Normal actions have stopped; an open trade is closed by running the safety check (expiry closure).";
 
 /** Phase 1B.1 (D3): a client event time may not precede the trade's last recorded update (at least the entry). */
 function notBefore(trade: PaperTradeRecord): { notBefore: string; notBeforeLabel: string } {
@@ -183,21 +187,30 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
   }
 
   return {
-    /** CANDIDATE: evaluate only. Nothing is stored and nothing is opened. */
+    /**
+     * CANDIDATE: evaluate only. Nothing is stored and nothing is opened. Phase 1B.2 (A12): refused at or after the
+     * contract's provisional cutoff.
+     */
     assess(raw: unknown): ServiceResult<AssessResponseDTO> {
       const t = now();
       const parsed = parseCandidateInput(raw, { now: t, newId });
       if (!parsed.ok) return invalid(parsed);
+      if (isAtOrPastExpiryCutoff(parsed.value.expiry, Date.parse(t))) return fail("CONTRACT_EXPIRED", expiredMessage(parsed.value.expiry, "Assessing a candidate"));
       const review = buildReview(parsed.value, t);
       return good({ state: review.entryStatus === "EXECUTABLE" ? "CANDIDATE" : "DATA_INSUFFICIENT", candidate: parsed.value, review });
     },
 
-    /** CANDIDATE -> PAPER_REVIEW (or DATA_INSUFFICIENT). This never opens a trade. */
-    beginReview(raw: unknown): Promise<ServiceResult<PaperTradeRecord>> {
+    /**
+     * CANDIDATE -> PAPER_REVIEW (or DATA_INSUFFICIENT). This never opens a trade. Phase 1B.2 (A12): refused at or after
+     * the contract's provisional cutoff, and then nothing is stored or journaled.
+     */
+    beginReview(raw: unknown): Promise<ServiceResult<PaperTradeView>> {
       return guard(async () => {
         const t = now();
+        const nowMs = Date.parse(t);
         const parsed = parseCandidateInput(raw, { now: t, newId });
         if (!parsed.ok) return invalid(parsed);
+        if (isAtOrPastExpiryCutoff(parsed.value.expiry, nowMs)) return fail("CONTRACT_EXPIRED", expiredMessage(parsed.value.expiry, "Starting a review"));
         const candidate = parsed.value;
         const review = buildReview(candidate, t);
         const executable = review.entryStatus === "EXECUTABLE";
@@ -229,7 +242,7 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
           payload: { candidateId: candidate.candidateId, source: candidate.source, structure: candidate.structure, reasons: review.entryReasons },
         });
         return executable
-          ? good(stored)
+          ? good(toView(stored, nowMs))
           : fail("DATA_INSUFFICIENT", "The candidate has no executable entry prices, so it cannot be reviewed or opened.", review.entryReasons, stored);
       });
     },
@@ -239,7 +252,7 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
      * executable quotes for the exact legs. Entry premium, capital and entry risk are recalculated from those quotes;
      * the review-time prices are kept as history and never reused.
      */
-    confirm(tradeId: string, raw: unknown): Promise<ServiceResult<PaperTradeRecord>> {
+    confirm(tradeId: string, raw: unknown): Promise<ServiceResult<PaperTradeView>> {
       return guard(async () => {
         const parsed = parseConfirmRequest(raw);
         if (!parsed.ok) return invalid(parsed);
@@ -252,6 +265,13 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
         const t = now();
         const nowMs = Date.parse(t);
         const candidate = trade.candidate;
+        // Phase 1B.2 (A7): an expired review stays PAPER_REVIEW (no new lifecycle state) and can no longer be confirmed.
+        if (isAtOrPastExpiryCutoff(candidate.expiry, nowMs)) {
+          const cutoff = expiryCutoffInstant(candidate.expiry);
+          await repository.appendEvent({ timestamp: t, type: "CONFIRM_REJECTED_EXPIRED", tradeId, fromState: "PAPER_REVIEW", toState: "PAPER_REVIEW", payload: { code: "CONTRACT_EXPIRED", expiryCutoff: cutoff } });
+          const unchanged = (await repository.getTrade(tradeId)) ?? trade;
+          return fail("CONTRACT_EXPIRED", expiredMessage(candidate.expiry, "Confirming this paper trade"), [`Cutoff ${cutoff}; server time ${t}. The trade stays in PAPER_REVIEW.`], unchanged);
+        }
         const fresh = resolveFreshEntryQuotes(candidate.legs, parsed.value.quotes, nowMs);
         if (!fresh.ok) {
           await repository.appendEvent({ timestamp: t, type: "CONFIRM_REJECTED_QUOTE", tradeId, fromState: "PAPER_REVIEW", toState: "PAPER_REVIEW", payload: { code: fresh.code, reasons: fresh.reasons } });
@@ -320,12 +340,17 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
           { updatedAt: t, state: "PAPER_OPEN", entry: snapshot, currentRisk: entryRisk },
           { timestamp: t, type: "TRADE_OPENED", tradeId, fromState: "PAPER_REVIEW", toState: "PAPER_OPEN", payload: { combinedEntryPremium: snapshot.combinedEntryPremium, lots, riskLevel: entryRisk.result.riskLevel, quoteAsOf: fresh.legs.map((l) => l.quoteAsOf) } },
         );
-        return good(updated);
+        return good(toView(updated, nowMs));
       });
     },
 
-    /** Records current prices, current risk and unrealized P&L. Entry risk and the entry snapshot are untouched. */
-    monitor(tradeId: string, raw: unknown): Promise<ServiceResult<PaperTradeRecord>> {
+    /**
+     * Records current prices, current risk and unrealized P&L. Entry risk and the entry snapshot are untouched.
+     * Phase 1B.2: refused at or after the contract's cutoff (A12). Prices are manual entries checked by the shared rule
+     * (A2, HIGH-2); a bad price gives a DATA_INSUFFICIENT snapshot and never replaces the last valid bids (A8).
+     * A quote for another instrument is an INVALID_REQUEST (D1).
+     */
+    monitor(tradeId: string, raw: unknown): Promise<ServiceResult<PaperTradeView>> {
       return guard(async () => {
         const parsed = parseMonitorRequest(raw);
         if (!parsed.ok) return invalid(parsed);
@@ -337,14 +362,21 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
 
         const req = parsed.value;
         const serverNow = now();
-        const late = req.asOf === undefined ? [] : checkEventTime(req.asOf, { nowMs: Date.parse(serverNow), ...notBefore(trade) });
+        const nowMs = Date.parse(serverNow);
+        if (isAtOrPastExpiryCutoff(trade.candidate.expiry, nowMs)) {
+          return fail("CONTRACT_EXPIRED", expiredMessage(trade.candidate.expiry, "Monitoring"), [`Cutoff ${expiryCutoffInstant(trade.candidate.expiry)}; server time ${serverNow}.`], trade);
+        }
+        const late = req.asOf === undefined ? [] : checkEventTime(req.asOf, { nowMs, ...notBefore(trade) });
         if (late.length > 0) return fail("INVALID_REQUEST", "The monitor time (asOf) is not acceptable.", late, trade);
+        const foreign = foreignQuoteReasons(trade.candidate.legs, req.quotes);
+        if (foreign.length > 0) return fail("INVALID_REQUEST", "Quotes were supplied for instruments that are not legs of this trade. Nothing was recorded.", foreign, trade);
         // Review correction R2: the authoritative time is the SERVER clock. A validated client asOf is kept only as
         // observational metadata (clientAsOf); it never becomes updatedAt or a journal event time.
         const asOf = serverNow;
         const clientAsOf = req.asOf;
-        const bidsResult = resolveLegBids(trade.candidate.legs, req.quotes);
-        const exitPremium = exitPremiumOf(bidsResult.bids);
+        const checked = resolveManualPrices(trade.candidate.legs, req.quotes, nowMs);
+        const timedByLeg = checked.ok ? checked.legs : null;
+        const exitPremium = timedByLeg === null ? null : exitPremiumOf(timedByLeg.map((t) => t.quote.bid));
         const valid = exitPremium !== null;
         const unrealized = computePnl({
           entryPremium: entry.combinedEntryPremium,
@@ -355,12 +387,12 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
           exitCosts: req.exitCosts ?? null,
         });
 
-        // Current risk: market data is NOT carried from entry (missing stays missing). Strategy outputs and
-        // capital parameters ARE carried, and listed in carriedFromEntry for transparency.
-        const currentLegs: PaperLeg[] = trade.candidate.legs.map((leg) => {
-          const matches = req.quotes.filter((q) => sameInstrument(q.instrument, leg.instrument));
-          const q = matches.length >= 1 && new Set(matches.map((m) => m.bid)).size === 1 ? matches[0] : undefined;
-          return { ...leg, quote: { bid: q?.bid ?? null, ask: q?.ask ?? null, ltp: q?.ltp ?? null, bidQty: q?.bidQty ?? null, askQty: q?.askQty ?? null, volume: q?.volume ?? null, oi: q?.oi ?? null } };
+        // Current risk: market data is NOT carried from entry (missing stays missing). Strategy outputs and capital
+        // parameters ARE carried, and listed in carriedFromEntry. A leg's quote is used only when it is unambiguous.
+        const legQuote = (i: number): EntryQuoteDTO | null => (timedByLeg !== null ? (timedByLeg[i]?.quote ?? null) : checked.ok ? null : (checked.unambiguous[i] ?? null));
+        const currentLegs: PaperLeg[] = trade.candidate.legs.map((leg, i) => {
+          const q = legQuote(i);
+          return { ...leg, quote: q === null ? { bid: null, ask: null, ltp: null, bidQty: null, askQty: null, volume: null, oi: null } : toPaperQuote(q) };
         });
         const currentCandidate: PaperCandidate = {
           ...trade.candidate,
@@ -375,29 +407,39 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
 
         const snapshot: PaperMonitorSnapshot = {
           asOf,
-          legs: currentLegs.map((l, i) => ({ instrument: l.instrument, bid: l.quote.bid, ask: l.quote.ask, bidValid: bidsResult.bids[i] !== null })),
+          legs: currentLegs.map((l, i) => {
+            const t = timedByLeg?.[i];
+            return { instrument: l.instrument, bid: l.quote.bid, ask: l.quote.ask, bidValid: valid, ...(t ? { enteredAt: t.enteredAt, entryAgeMs: t.entryAgeMs } : {}) };
+          }),
           dataStatus: valid ? "VALID" : "DATA_INSUFFICIENT",
-          dataReasons: bidsResult.reasons,
+          dataReasons: checked.ok ? [] : checked.reasons,
           currentExitPremium: exitPremium,
           unrealized,
           currentRisk,
           carriedFromEntry,
           ...(clientAsOf !== undefined ? { clientAsOf } : {}),
+          priceProvenance: "MANUAL_USER_ENTRY",
+          valuationRule: valuationRuleAt(trade.candidate.expiry, asOf),
         };
-        const lastValidExit: LastValidExit | undefined = valid
-          ? { asOf, legBids: trade.candidate.legs.map((l, i) => ({ instrument: l.instrument, bid: bidsResult.bids[i] as number })), exitPremium }
-          : undefined;
+        const lastValidExit: LastValidExit | undefined =
+          valid && timedByLeg !== null
+            ? { asOf, legBids: timedByLeg.map((t) => ({ instrument: t.leg.instrument, bid: t.quote.bid as number, enteredAt: t.enteredAt })), exitPremium, priceProvenance: "MANUAL_USER_ENTRY" }
+            : undefined;
         const updated = await repository.updateLifecycle(
           tradeId,
           { updatedAt: asOf, lastMonitor: snapshot, currentRisk, ...(lastValidExit ? { lastValidExit } : {}) },
           { timestamp: asOf, type: "MONITOR_SNAPSHOT", tradeId, fromState: "PAPER_OPEN", toState: "PAPER_OPEN", payload: { dataStatus: snapshot.dataStatus, currentExitPremium: exitPremium, grossPnl: unrealized.grossPnl, riskLevel: currentRisk.result.riskLevel, ...(clientAsOf !== undefined ? { clientAsOf } : {}) } },
         );
-        return good(updated);
+        return good(toView(updated, nowMs));
       });
     },
 
-    /** PAPER_OPEN -> PAPER_EXITED, only with a valid executable bid on EVERY leg. Otherwise nothing changes. */
-    exit(tradeId: string, raw: unknown): Promise<ServiceResult<PaperTradeRecord>> {
+    /**
+     * PAPER_OPEN -> PAPER_EXITED, only with checked manual prices for EVERY leg. Otherwise nothing changes.
+     * Phase 1B.2: refused at or after the cutoff (A12); bid AND ask must pass the entry rule (HIGH-2); each price must
+     * carry a user-entry time within the approved time limits (A1, A2). The valuation is MANUAL_ENTRY_CHECKED (A9).
+     */
+    exit(tradeId: string, raw: unknown): Promise<ServiceResult<PaperTradeView>> {
       return guard(async () => {
         const parsed = parseExitRequest(raw);
         if (!parsed.ok) return invalid(parsed);
@@ -409,31 +451,46 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
 
         const req = parsed.value;
         const serverNow = now();
-        const late = req.asOf === undefined ? [] : checkEventTime(req.asOf, { nowMs: Date.parse(serverNow), ...notBefore(trade) });
-        if (late.length > 0) return fail("INVALID_REQUEST", "The exit time (asOf) is not acceptable.", late, trade);
+        const nowMs = Date.parse(serverNow);
         // Review correction R2: server time is authoritative for the exit, its journal event and a rejected attempt.
         const at = serverNow;
         const clientAsOf = req.asOf;
-        const bidsResult = resolveLegBids(trade.candidate.legs, req.quotes);
-        const exitPremium = exitPremiumOf(bidsResult.bids);
-        if (exitPremium === null) {
-          await repository.appendEvent({ timestamp: at, type: "EXIT_REJECTED_DATA_INSUFFICIENT", tradeId, fromState: "PAPER_OPEN", toState: "PAPER_OPEN", payload: { reasons: bidsResult.reasons, ...(clientAsOf !== undefined ? { clientAsOf } : {}) } });
+        if (isAtOrPastExpiryCutoff(trade.candidate.expiry, nowMs)) {
+          const cutoff = expiryCutoffInstant(trade.candidate.expiry);
+          await repository.appendEvent({ timestamp: at, type: "EXIT_REJECTED_EXPIRED", tradeId, fromState: "PAPER_OPEN", toState: "PAPER_OPEN", payload: { code: "CONTRACT_EXPIRED", expiryCutoff: cutoff, ...(clientAsOf !== undefined ? { clientAsOf } : {}) } });
           const unchanged = await repository.getTrade(tradeId);
-          return fail("DATA_INSUFFICIENT", "No valid executable bid for every leg. The trade stays PAPER_OPEN; no exit price is invented.", bidsResult.reasons, unchanged ?? trade);
+          return fail("CONTRACT_EXPIRED", expiredMessage(trade.candidate.expiry, "Exiting"), [`Cutoff ${cutoff}; server time ${serverNow}. The trade stays PAPER_OPEN until the expiry closure runs.`], unchanged ?? trade);
         }
+        const late = req.asOf === undefined ? [] : checkEventTime(req.asOf, { nowMs, ...notBefore(trade) });
+        if (late.length > 0) return fail("INVALID_REQUEST", "The exit time (asOf) is not acceptable.", late, trade);
+        const checked = resolveManualPrices(trade.candidate.legs, req.quotes, nowMs);
+        if (!checked.ok) {
+          if (checked.code === "INVALID_REQUEST") return fail("INVALID_REQUEST", "Quotes were supplied for instruments that are not legs of this trade. The trade stays PAPER_OPEN.", checked.reasons, trade);
+          const type = checked.code === "QUOTE_NOT_FRESH" ? "EXIT_REJECTED_QUOTE" : "EXIT_REJECTED_DATA_INSUFFICIENT";
+          await repository.appendEvent({ timestamp: at, type, tradeId, fromState: "PAPER_OPEN", toState: "PAPER_OPEN", payload: { code: checked.code, reasons: checked.reasons, ...(clientAsOf !== undefined ? { clientAsOf } : {}) } });
+          const unchanged = await repository.getTrade(tradeId);
+          const message =
+            checked.code === "QUOTE_NOT_FRESH"
+              ? `Every exit price needs its own entry time, at most ${TIME_RULES.maxManualPriceAgeMs / 1000} s before the server processes it. The trade stays PAPER_OPEN.`
+              : "No valid bid and ask for every leg. The trade stays PAPER_OPEN; no exit price is invented.";
+          return fail(checked.code, message, checked.reasons, unchanged ?? trade);
+        }
+        const exitPremium = exitPremiumOf(checked.legs.map((t) => t.quote.bid)) as number;
         const exit: PaperExitRecord = {
           timestamp: at,
           trigger: "USER_EXIT",
           basis: "CURRENT_QUOTE",
           // R4: these quotes carry no observation time, so none is recorded. `timestamp` is the server processing time.
           priceAsOf: null,
-          legBids: trade.candidate.legs.map((l, i) => ({ instrument: l.instrument, bid: bidsResult.bids[i] ?? null })),
+          legBids: checkedLegPrices(checked.legs),
           exitPremium,
           exitCosts: req.exitCosts ?? null,
           notes: [],
-          valuationStatus: "EXECUTABLE_QUOTE",
+          valuationStatus: "MANUAL_ENTRY_CHECKED",
           staleReference: null,
           ...(clientAsOf !== undefined ? { clientAsOf } : {}),
+          priceProvenance: "MANUAL_USER_ENTRY",
+          valuationRule: valuationRuleAt(trade.candidate.expiry, at),
         };
         const realizedPnl = computePnl({ entryPremium: entry.combinedEntryPremium, exitPremium, lotSize: entry.lotSize, lots: entry.lots, entryCosts: entry.capital.entryCosts, exitCosts: req.exitCosts ?? null });
         const updated = await repository.updateLifecycle(
@@ -441,48 +498,96 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
           { updatedAt: at, state: "PAPER_EXITED", exit, realizedPnl },
           { timestamp: at, type: "TRADE_EXITED", tradeId, fromState: "PAPER_OPEN", toState: "PAPER_EXITED", payload: { exitPremium, grossPnl: realizedPnl.grossPnl, netPnl: realizedPnl.netPnl, ...(clientAsOf !== undefined ? { clientAsOf } : {}) } },
         );
-        return good(updated);
+        return good(toView(updated, nowMs));
       });
     },
 
     /**
      * Expiry and safety closure. Records the lifecycle event in every case and never invents an exit price.
-     * Phase 1B.1: the decision uses the trusted SERVER clock (D3, D4); a client asOf is validated and recorded only.
-     * Valuation uses valid CURRENT bids for every leg, or nothing: an old monitored bid is kept as a historical
-     * reference only and P&L is DATA_INSUFFICIENT (D2).
+     * The decision uses the trusted SERVER clock (D3, D4); a client asOf is validated and recorded only.
+     * Phase 1B.2:
+     *  - EXPIRY (at or after the provisional 15:30 IST cutoff, A3) is NEVER valued: there is no approved settlement-price
+     *    source, so basis NONE and P&L DATA_INSUFFICIENT, whatever prices are supplied (A4). An earlier monitored bid stays
+     *    a historical reference only (D2).
+     *  - HOLDING_LIMIT uses a session count typed by the user (no trading calendar). It is valued only from manual prices
+     *    that pass the shared rule before the cutoff (MANUAL_ENTRY_CHECKED); otherwise it closes unpriced (A5).
+     *  - A quote for another instrument is an INVALID_REQUEST and nothing changes (D1) - before the cutoff.
+     *  - Safety-review correction: at or after the cutoff the SERVER clock alone decides. Untrusted request metadata
+     *    (an unacceptable or malformed client asOf, a quote for another instrument) cannot block the required unpriced
+     *    expiry closure; it is ignored, never recorded as clientAsOf and never used for any price, and a note says so.
+     *    Before the cutoff every check above is unchanged, and any other invalid field is still refused.
      */
     runSafetyCheck(tradeId: string, raw: unknown): Promise<ServiceResult<SafetyCheckResponseDTO>> {
       return guard(async () => {
         const parsed = parseSafetyCheckRequest(raw);
-        if (!parsed.ok) return invalid(parsed);
+        // If the client asOf is the ONLY invalid field, the decision is deferred until the server clock is known.
+        // Every other parse error is refused at once, exactly as before.
+        let deferredAsOf: Extract<ParseResult<unknown>, { ok: false }> | null = null;
+        let req: SafetyCheckRequestDTO;
+        if (parsed.ok) {
+          req = parsed.value;
+        } else {
+          const hasAsOf = typeof raw === "object" && raw !== null && !Array.isArray(raw) && (raw as Record<string, unknown>)["asOf"] !== undefined;
+          const withoutAsOf = hasAsOf ? parseSafetyCheckRequest({ ...(raw as Record<string, unknown>), asOf: undefined }) : null;
+          if (withoutAsOf === null || !withoutAsOf.ok) return invalid(parsed);
+          deferredAsOf = parsed;
+          req = withoutAsOf.value;
+        }
         const loaded = await load(tradeId);
-        if (!loaded.ok) return loaded;
+        if (!loaded.ok) return deferredAsOf !== null ? invalid(deferredAsOf) : loaded;
         const trade = loaded.trade;
         const entry = trade.entry;
-        if (trade.state !== "PAPER_OPEN" || entry === null) return fail("INVALID_TRANSITION", `Only a PAPER_OPEN trade can be safety-checked (this one is ${trade.state}).`, undefined, trade);
+        if (trade.state !== "PAPER_OPEN" || entry === null) {
+          if (deferredAsOf !== null) return invalid(deferredAsOf);
+          return fail("INVALID_TRANSITION", `Only a PAPER_OPEN trade can be safety-checked (this one is ${trade.state}).`, undefined, trade);
+        }
 
-        const req = parsed.value;
         const serverNow = now();
-        const late = req.asOf === undefined ? [] : checkEventTime(req.asOf, { nowMs: Date.parse(serverNow), ...notBefore(trade) });
-        if (late.length > 0) return fail("INVALID_REQUEST", "The client time (asOf) is not acceptable. Expiry and safety are decided on server time.", late, trade);
-
+        const nowMs = Date.parse(serverNow);
+        // The server clock decides (D3, A3). completedSessions was parsed strictly above.
         const decision = evaluateSafety({ expiry: trade.candidate.expiry, asOf: serverNow, completedSessions: req.completedSessions ?? null });
-        if (decision.action === "NONE") return good({ decision, trade });
+        const expired = decision.action === "EXPIRE";
+        const quotes = req.quotes ?? [];
+        const late = deferredAsOf !== null ? deferredAsOf.errors : req.asOf === undefined ? [] : checkEventTime(req.asOf, { nowMs, ...notBefore(trade) });
+        const foreign = foreignQuoteReasons(trade.candidate.legs, quotes);
+        const ignored: string[] = [];
+        if (!expired) {
+          // Before the cutoff: unchanged strict behaviour.
+          if (deferredAsOf !== null) return invalid(deferredAsOf);
+          if (late.length > 0) return fail("INVALID_REQUEST", "The client time (asOf) is not acceptable. Expiry and safety are decided on server time.", late, trade);
+          if (foreign.length > 0) return fail("INVALID_REQUEST", "Quotes were supplied for instruments that are not legs of this trade. Nothing was changed.", foreign, trade);
+        } else {
+          if (late.length > 0) ignored.push(`The client time (asOf) was not acceptable and was ignored; expiry is decided on server time: ${late.join("; ")}`);
+          if (foreign.length > 0) ignored.push(`Quotes for instruments that are not legs of this trade were ignored: ${foreign.join("; ")}`);
+        }
+        const clientAsOf = req.asOf !== undefined && late.length === 0 ? req.asOf : undefined;
 
-        const current = resolveLegBids(trade.candidate.legs, req.quotes ?? []);
-        const currentPremium = exitPremiumOf(current.bids);
+        if (decision.action === "NONE") return good({ decision, trade: toView(trade, nowMs) });
+
+        const trigger = expired ? "EXPIRY" : "HOLDING_LIMIT";
         const notes: string[] = [];
+        const checked = trigger === "HOLDING_LIMIT" && quotes.length > 0 ? resolveManualPrices(trade.candidate.legs, quotes, nowMs) : null;
+        const rule = valuationRuleAt(trade.candidate.expiry, serverNow);
+        const sessions = trigger === "HOLDING_LIMIT" ? { sessionsSource: "USER_PROVIDED" as const } : {};
         let exit: PaperExitRecord;
-        const trigger = decision.action === "EXPIRE" ? "EXPIRY" : "HOLDING_LIMIT";
-        if (currentPremium !== null) {
+        if (checked !== null && checked.ok) {
           exit = {
             timestamp: serverNow, trigger, basis: "CURRENT_QUOTE", priceAsOf: null, // R4: no quote-observation time exists
-            legBids: trade.candidate.legs.map((l, i) => ({ instrument: l.instrument, bid: current.bids[i] ?? null })),
-            exitPremium: currentPremium, exitCosts: req.exitCosts ?? null, notes,
-            valuationStatus: "EXECUTABLE_QUOTE", staleReference: null,
+            legBids: checkedLegPrices(checked.legs),
+            exitPremium: exitPremiumOf(checked.legs.map((t) => t.quote.bid)), exitCosts: req.exitCosts ?? null,
+            notes: ["Holding limit: the completed-session count was entered by the user; there is no trading calendar."],
+            valuationStatus: "MANUAL_ENTRY_CHECKED", staleReference: null,
+            priceProvenance: "MANUAL_USER_ENTRY", valuationRule: rule, ...sessions,
           };
         } else {
-          notes.push("No valid executable bid for every leg at closure, so there is no exit price and P&L is DATA_INSUFFICIENT.", ...current.reasons);
+          if (trigger === "EXPIRY") {
+            notes.push("Expiry closure: there is no approved settlement-price source, so there is no exit price and P&L is DATA_INSUFFICIENT.");
+            if (quotes.length > 0) notes.push("Supplied prices were not used: after the cutoff there is no live market to value the contract from.");
+            notes.push(...ignored);
+          } else {
+            notes.push("Holding limit: the completed-session count was entered by the user; there is no trading calendar.");
+            notes.push("No checked manual price for every leg at closure, so there is no exit price and P&L is DATA_INSUFFICIENT.", ...(checked !== null && !checked.ok ? checked.reasons : []));
+          }
           if (trade.lastValidExit !== null) {
             notes.push(`The last valid monitored bids (recorded by the server at ${trade.lastValidExit.asOf}, exit premium ${trade.lastValidExit.exitPremium}) are kept as staleReference for historical reference only. They are not an executable exit price and are not used for P&L.`);
           }
@@ -491,6 +596,7 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
             legBids: trade.candidate.legs.map((l) => ({ instrument: l.instrument, bid: null })),
             exitPremium: null, exitCosts: req.exitCosts ?? null, notes,
             valuationStatus: "DATA_INSUFFICIENT", staleReference: trade.lastValidExit,
+            priceProvenance: "NONE", valuationRule: rule, ...sessions,
           };
         }
         const realizedPnl = computePnl({ entryPremium: entry.combinedEntryPremium, exitPremium: exit.exitPremium, lotSize: entry.lotSize, lots: entry.lots, entryCosts: entry.capital.entryCosts, exitCosts: req.exitCosts ?? null });
@@ -502,29 +608,35 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
             timestamp: serverNow,
             type: decision.action === "EXPIRE" ? "TRADE_EXPIRED" : "TRADE_AUTO_CLOSED",
             tradeId, fromState: "PAPER_OPEN", toState,
-            payload: { reasons: decision.reasons, basis: exit.basis, valuationStatus: exit.valuationStatus, pnlStatus: realizedPnl.status, ...(req.asOf ? { clientAsOf: req.asOf } : {}) },
+            payload: { reasons: decision.reasons, basis: exit.basis, valuationStatus: exit.valuationStatus, pnlStatus: realizedPnl.status, ...(clientAsOf ? { clientAsOf } : {}) },
           },
         );
-        return good({ decision, trade: updated });
+        return good({ decision, trade: toView(updated, nowMs) });
       });
     },
 
-    getTrade(tradeId: string): Promise<ServiceResult<{ trade: PaperTradeRecord; events: JournalEventRecord[] }>> {
+    /** The trade (with derived priceQuality and expiryStatus) and its journal events. Reading never changes anything. */
+    getTrade(tradeId: string): Promise<ServiceResult<{ trade: PaperTradeView; events: JournalEventRecord[] }>> {
       return guard(async () => {
+        const nowMs = Date.parse(now());
         const loaded = await load(tradeId);
         if (!loaded.ok) return loaded;
-        return good({ trade: loaded.trade, events: await repository.listEvents({ tradeId }) });
+        return good({ trade: toView(loaded.trade, nowMs), events: await repository.listEvents({ tradeId }) });
       });
     },
 
     /** Lists trades. The risk filter only selects rows (on current risk, else review risk); it changes nothing else. */
-    async listTrades(options: { states?: readonly PaperLifecycleState[]; risk?: RiskFilter } = {}): Promise<PaperTradeRecord[]> {
+    async listTrades(options: { states?: readonly PaperLifecycleState[]; risk?: RiskFilter } = {}): Promise<PaperTradeView[]> {
+      const nowMs = Date.parse(now());
       const trades = await repository.listTrades(options.states ? { states: options.states } : undefined);
-      if (options.risk === undefined) return trades;
-      return filterByRisk(
-        trades.map((trade) => ({ trade, risk: (trade.currentRisk ?? trade.review.risk).result })),
-        options.risk,
-      ).map((x) => x.trade);
+      const selected =
+        options.risk === undefined
+          ? trades
+          : filterByRisk(
+              trades.map((trade) => ({ trade, risk: (trade.currentRisk ?? trade.review.risk).result })),
+              options.risk,
+            ).map((x) => x.trade);
+      return selected.map((t) => toView(t, nowMs));
     },
 
     listEvents(filter?: { tradeId?: string }): Promise<JournalEventRecord[]> {

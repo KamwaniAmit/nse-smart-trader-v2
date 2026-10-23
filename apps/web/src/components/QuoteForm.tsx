@@ -17,12 +17,14 @@ interface Props {
   legs: readonly QuoteLeg[];
   /** Also ask for ask, volume, open interest and depth (used by monitoring, to assess current risk). */
   extended?: boolean;
+  /** Phase 1B.2 (HIGH-2): also ask for each leg's ask (exit and safety check). Implied by `extended`. */
+  withAsk?: boolean;
   /**
    * Phase 1B.1 (D1, review correction R1): send each leg's quote time (asOf). For manually typed prices the form records a
    * user-entry time per PRICE (bid and ask separately); volume, open interest and depth never change it. The time sent is
    * the OLDER of the leg's bid and ask entry times, so a quote is never presented as newer than its stalest price. If
    * either price has no entry time, no asOf is sent and the server refuses the quote. The server checks the time against
-   * its own clock and refuses quotes older than 60 s.
+   * its own clock and refuses quotes older than 60 s. Phase 1B.2 (A2): used for monitor, exit and safety prices too.
    */
   timestamped?: boolean;
   /** Optional content shown above the submit button (for example the confirmation checkbox). */
@@ -41,7 +43,8 @@ const num = (s: string | undefined): number | null => {
 };
 
 /** Prices for the EXACT stored legs. A leg left blank is sent as no price, never as zero and never as an LTP. */
-export function QuoteForm({ title, legs, extended = false, timestamped = false, beforeSubmit, extra, submitLabel, disabled, onSubmit }: Props) {
+export function QuoteForm({ title, legs, extended = false, withAsk = false, timestamped = false, beforeSubmit, extra, submitLabel, disabled, onSubmit }: Props) {
+  const asks = extended || withAsk;
   const [values, setValues] = useState<Record<string, string>>({});
   /** User-entry time per PRICE field ("bid0", "ask0", ...). Only bid and ask have one; depth fields never do. */
   const [priceEnteredAt, setPriceEnteredAt] = useState<Record<string, string>>({});
@@ -77,7 +80,7 @@ export function QuoteForm({ title, legs, extended = false, timestamped = false, 
     legs.map((leg, i) => ({
       instrument: leg.instrument,
       bid: num(values[`bid${i}`]),
-      ...(extended ? { ask: num(values[`ask${i}`]), volume: num(values[`volume${i}`]), oi: num(values[`oi${i}`]), bidQty: num(values[`bidQty${i}`]), askQty: num(values[`askQty${i}`]) } : {}),
+      ...(extended ? { ask: num(values[`ask${i}`]), volume: num(values[`volume${i}`]), oi: num(values[`oi${i}`]), bidQty: num(values[`bidQty${i}`]), askQty: num(values[`askQty${i}`]) } : withAsk ? { ask: num(values[`ask${i}`]) } : {}),
       ...(timestamped && quoteTimeOf(i) !== undefined ? { asOf: quoteTimeOf(i) } : {}),
     }));
 
@@ -88,10 +91,14 @@ export function QuoteForm({ title, legs, extended = false, timestamped = false, 
         <div key={leg.instrument.id}>
           {field(`bid${i}`, `${leg.label} bid`)}
           {timestamped && priceEnteredAt[`bid${i}`] ? <span className="hint">{`${leg.label} bid entered at ${priceEnteredAt[`bid${i}`]}`}</span> : null}
-          {extended ? (
+          {asks ? (
             <>
               {field(`ask${i}`, `${leg.label} ask`)}
               {timestamped && priceEnteredAt[`ask${i}`] ? <span className="hint">{`${leg.label} ask entered at ${priceEnteredAt[`ask${i}`]}`}</span> : null}
+            </>
+          ) : null}
+          {extended ? (
+            <>
               {field(`volume${i}`, `${leg.label} volume`)}
               {field(`oi${i}`, `${leg.label} open interest`)}
               {field(`bidQty${i}`, `${leg.label} bid quantity`)}
@@ -104,8 +111,8 @@ export function QuoteForm({ title, legs, extended = false, timestamped = false, 
       {timestamped ? (
         <p className="hint">
           Times shown are user-entry times, not exchange timestamps: the moment you typed each bid and ask. Each leg is sent with the older of its two
-          price times; editing volume, open interest or depth does not change it. The server refuses quotes older than 60 seconds, so enter prices
-          just before confirming. These times do not prove that the prices were current market prices.
+          price times; editing volume, open interest or depth does not change it. The server refuses prices entered more than 60 seconds before it
+          processes them, so enter prices just before submitting. These times do not prove that the prices were current market prices.
         </p>
       ) : null}
       {beforeSubmit}

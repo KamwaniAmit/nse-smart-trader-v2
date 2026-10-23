@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { JOURNAL_DURABILITY_NOTICE } from "@nsest/core/contracts";
-import type { JournalEventRecord, PaperTradeRecord } from "@nsest/core/contracts";
+import type { JournalEventRecord, PaperTradeView } from "@nsest/core/contracts";
 import { exportUrl, getTrade, listJournal, listTrades } from "../apiClient";
 import { RiskBadge } from "../components/RiskBadge";
 import { StatusBadge } from "../components/StatusBadge";
@@ -12,7 +12,10 @@ const ACTIVE = ["PAPER_REVIEW", "PAPER_OPEN"];
 
 const message = (e: unknown): string => (e instanceof Error ? e.message : "Request failed");
 
-function TradeTable({ trades, selectedId, onSelect }: { trades: readonly PaperTradeRecord[]; selectedId: string | null; onSelect: (id: string) => void }) {
+/** A trade as listed. priceQuality / expiryStatus are derived by the server (Phase 1B.2); older responses may lack them. */
+type ListedTrade = Omit<PaperTradeView, "priceQuality" | "expiryStatus"> & Partial<Pick<PaperTradeView, "priceQuality" | "expiryStatus">>;
+
+function TradeTable({ trades, selectedId, onSelect }: { trades: readonly ListedTrade[]; selectedId: string | null; onSelect: (id: string) => void }) {
   return (
     <table>
       <thead>
@@ -27,7 +30,12 @@ function TradeTable({ trades, selectedId, onSelect }: { trades: readonly PaperTr
               <td><StatusBadge status={t.state} /></td>
               <td><RiskBadge level={(t.entry ? t.entry.risk : t.review.risk).result.riskLevel} /></td>
               <td>{t.state === "PAPER_OPEN" ? <RiskBadge level={t.currentRisk?.result.riskLevel ?? null} /> : <span className="hint">n/a</span>}</td>
-              <td>{pnl ? pnlText(pnl) : <span className="hint">n/a</span>}</td>
+              <td>
+                {pnl ? pnlText(pnl) : <span className="hint">n/a</span>}
+                {!t.realizedPnl && t.lastMonitor ? <><br /><span className="hint">recorded {t.lastMonitor.asOf}</span></> : null}
+                {t.priceQuality ? <><br /><span className="hint" title={t.priceQuality.note}>{t.priceQuality.level}</span></> : null}
+                {t.expiryStatus && (t.expiryStatus.status === "EXPIRED_PENDING_CLOSURE" || t.expiryStatus.status === "EXPIRED_REVIEW") ? <><br /><span className="notice">{t.expiryStatus.status}</span></> : null}
+              </td>
               <td><button type="button" onClick={() => onSelect(t.tradeId)}>Open {t.tradeId}</button></td>
             </tr>
           );
@@ -40,10 +48,10 @@ function TradeTable({ trades, selectedId, onSelect }: { trades: readonly PaperTr
 export function PaperTrading() {
   const [tab, setTab] = useState<Tab>("active");
   const [tick, setTick] = useState(0);
-  const [trades, setTrades] = useState<PaperTradeRecord[]>([]);
+  const [trades, setTrades] = useState<ListedTrade[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [detail, setDetail] = useState<{ trade: PaperTradeRecord; events: JournalEventRecord[] } | null>(null);
+  const [detail, setDetail] = useState<{ trade: ListedTrade; events: JournalEventRecord[] } | null>(null);
   const [events, setEvents] = useState<JournalEventRecord[]>([]);
 
   useEffect(() => {

@@ -1,4 +1,4 @@
-# Paper Trading (Phase 1B)
+# Paper Trading (Phase 1B, 1B.1, 1B.2)
 
 Paper trading is **broker-independent**. It never contacts a broker, never uses credentials, and never places an order.
 It works on prices that **you supply** (manual entry), and it records everything in a local journal.
@@ -98,6 +98,10 @@ The rules are in `RISK_ENGINE.md`.
 `monitor` records current bids (and, for risk, asks, volume, open interest and depth), the current exit premium, the unrealized P&L and the current
 risk. Valid bids are remembered as the *last valid exit*. An invalid update (a missing bid) records `DATA_INSUFFICIENT` and **does not overwrite** the last valid exit.
 
+**Phase 1B.2:** monitor prices pass the same manual-price checks as an exit (see "Manual prices (Phase 1B.2)"). An update with a missing, crossed,
+ambiguous or too-old price is still recorded, as a `DATA_INSUFFICIENT` snapshot with its reasons, and it **never replaces** the last valid bids (A8).
+A quote for an instrument that is not a leg of the trade is refused (`INVALID_REQUEST`) and nothing is recorded (D1).
+
 ## Time and freshness (Phase 1B.1)
 
 - The **server clock** is the only trusted time. It is injected into the service (`now`), so tests are deterministic.
@@ -110,9 +114,48 @@ risk. Valid bids are remembered as the *last valid exit*. An invalid update (a m
   of their own. So `exit.timestamp`, `lastMonitor.asOf` and `lastValidExit.asOf` (and `staleReference.asOf`) mean "when the server recorded it",
   and `exit.priceAsOf` (the quote-observation time) is **null: not available**. It is never filled with server or client time. Records written before
   R4 may hold a time in `priceAsOf`; the UI labels it as not a verified quote-observation time. The only per-quote times that exist are the
-  user-entry times on entry quotes (`entry.legs[].quoteAsOf`), which are not exchange timestamps either.
-- Allowed clock skew: **5 seconds** (`TIME_RULES.maxFutureSkewMs`). This is a DEFAULT engineering value with no source in the specification; it awaits owner review.
+  user-entry times on entry quotes (`entry.legs[].quoteAsOf`) and, since Phase 1B.2, on monitor, exit and holding-limit prices
+  (`legs[].enteredAt` / `legBids[].enteredAt`). None of them is an exchange timestamp, and `priceAsOf` stays null.
+- Allowed client-clock tolerance (future skew): **30 seconds** (`TIME_RULES.maxFutureSkewMs`, approved A1 in Phase 1B.2; it was a 5-second default before).
 - Quote freshness at confirmation: **60 seconds** (`TIME_RULES.maxQuoteAgeMs`, approved).
+- Manual price age for monitor, exit and holding-limit prices: **60 seconds** (`TIME_RULES.maxManualPriceAgeMs`, approved A2 in Phase 1B.2).
+
+## Manual prices (Phase 1B.2)
+
+Every price that values a trade (confirmation, monitor, exit, holding-limit closure) goes through one validation (`resolveTimedQuotes`):
+
+1. A quote for an instrument that is not a leg of the trade is refused with `INVALID_REQUEST`. Another strike, expiry or instrument is never substituted (D1).
+2. Each leg needs exactly one unambiguous quote with a valid **bid and ask** (both positive, ask not below bid; the unchanged Phase 1A rule).
+   A missing leg, conflicting duplicates or a non-executable quote gives `DATA_INSUFFICIENT`. LTP and theoretical prices are never used.
+3. Each quote needs its own `asOf`: the time **you entered** the price (a full timestamp with a zone). It may be at most **30 s** ahead of server time
+   and at most **60 s** old (both inclusive: 30,000 ms and 60,000 ms are accepted; 30,001 ms and 60,001 ms are refused). Otherwise `QUOTE_NOT_FRESH`.
+
+A valuation that passes is labelled **`MANUAL_ENTRY_CHECKED`** (A9) with `priceProvenance: MANUAL_USER_ENTRY`, the rule that was applied
+(`valuationRule`) and, per leg, the bid, ask, `enteredAt` and `entryAgeMs`. The exit `basis` stays `CURRENT_QUOTE`: that is a **legacy
+basis label**, kept so the journal and export schema do not change. For Phase 1B.2 records the valuation method is identified by
+`valuationStatus: MANUAL_ENTRY_CHECKED` together with `priceProvenance: MANUAL_USER_ENTRY`.
+
+> **What `MANUAL_ENTRY_CHECKED` means.** Only that the application's manual-input validation rules passed. The prices were typed by you; the time is
+> when you say you entered them. They are **not** exchange-sourced, exchange-timestamped or independently verified, and the application never claims they are.
+
+Records written before Phase 1B.2 are never rewritten. Their old labels (`EXECUTABLE_QUOTE`, `LAST_VALID_MONITOR_BID`, a stored `priceAsOf`) are kept as history
+and shown with the price-quality warnings below.
+
+## Price quality and expiry status (derived when read)
+
+Every API response that returns a trade (review, confirm, monitor, exit, safety check, get, list) adds two **derived** fields. They are computed from the
+stored record each time it is read and are **never written to the journal** (A10, D2, D3).
+
+- `priceQuality`: `{ level, flags, warnings, note }`. Levels:
+  - `MANUAL_ENTRY_CHECKED`: the P&L comes from prices that passed the Phase 1B.2 manual-input checks.
+  - `UNVERIFIED_LEGACY`: the P&L comes from prices the current rules did not check (older records), or the record's provenance is incomplete
+    (`PROVENANCE_INCOMPLETE`) or does not satisfy the rules (`PROVENANCE_INCONSISTENT`). Ambiguous records are never upgraded.
+  - `SUPERSEDED_RULE`: the P&L was produced by a rule that is no longer allowed (an earlier monitored bid, bids typed at expiry, or an action at or after the cutoff).
+  - `NO_PRICE`: there is no valid P&L.
+- `expiryStatus`: `{ status, cutoff }`, where status is `BEFORE_CUTOFF`, `EXPIRED_REVIEW` (a review that can no longer be confirmed; it stays `PAPER_REVIEW`, A7),
+  `EXPIRED_PENDING_CLOSURE` (open past the cutoff; run the safety check) or `CLOSED`.
+
+**The raw journal export (`GET /export`) is unchanged**: it contains the stored records only, without these derived fields. No enriched export exists.
 
 ## Expiry and safety (deterministic; no invented prices)
 
@@ -121,36 +164,47 @@ so a future-dated client time cannot force expiry.
 
 | Rule | Trigger | Result |
 |---|---|---|
-| Expiry | the server time's calendar **date in Asia/Kolkata** is after the expiry date | `PAPER_EXPIRED` |
+| Expiry | server time is at or after **15:30 Asia/Kolkata on the expiry date** (Phase 1B.2) | `PAPER_EXPIRED` |
 | Holding limit | `completedSessions` ≥ **2** (the frozen forward protocol) | `PAPER_AUTO_CLOSED` |
 
 - Expiry dates are NSE dates, read in **Asia/Kolkata** (IST). The date is computed in that zone, never by cutting the first ten characters off a timestamp,
   so `2026-10-06T22:30:00Z` (04:00 IST on the 7th) counts as the 7th.
-- The expiry **day itself is not treated as expired**, because market hours (an intraday cutoff) are not configured yet. A contract counts as expired from
-  **00:00 Asia/Kolkata on the day after** its expiry date. No holiday or expiry calendar is assumed.
+- **Phase 1B.2 (A3):** a contract counts as expired from **15:30:00.000 Asia/Kolkata on its expiry date** (inclusive; `2026-10-06` expires at
+  `2026-10-06T10:00:00.000Z`). This is a **provisional paper-safety cutoff, not a verified exchange calendar**: it does not account for exchange holidays,
+  special sessions or changed market hours. (Phase 1B and 1B.1 treated the whole expiry day as live and expired from 00:00 IST the next day.)
+- At or after the cutoff the application refuses to **assess**, **review**, **confirm** (journaled as `CONFIRM_REJECTED_EXPIRED`), **monitor** or **exit**
+  (journaled as `EXIT_REJECTED_EXPIRED`) with `CONTRACT_EXPIRED` (HTTP 409) (A6, A12). An open trade must be closed by the safety check. No new lifecycle state exists (A7).
 - There is no trading calendar, so `completedSessions` must be **supplied**. If it is not, the holding limit is reported as **not evaluated**. It is never estimated.
 - If both apply, expiry wins.
-- The lifecycle event is **always recorded**. The exit is valued **only** from valid CE/PE bids supplied in the call (basis `CURRENT_QUOTE`,
-  `valuationStatus: EXECUTABLE_QUOTE`). Otherwise there is no exit price: basis `NONE`, `valuationStatus: DATA_INSUFFICIENT`, P&L `DATA_INSUFFICIENT`.
+- The lifecycle event is **always recorded**.
+- **Phase 1B.2 (A4):** an **expiry** closure is never priced. There is no approved settlement-price source, so it records basis `NONE`,
+  `valuationStatus: DATA_INSUFFICIENT` and P&L `DATA_INSUFFICIENT`, even if prices are supplied. No settlement price is invented.
+- **At or after the cutoff the server clock alone decides.** Untrusted request metadata cannot block the required expiry closure: an
+  unacceptable or malformed client `asOf`, or a quote for an instrument that is not a leg of the trade, is ignored (noted on the exit record,
+  never stored as `clientAsOf` and never used for a price). Before the cutoff these are still refused with `INVALID_REQUEST`, and any other
+  invalid field (for example a fractional `completedSessions`) is always refused.
+- **Phase 1B.2 (A5):** a **holding-limit** closure is priced only from manual prices that pass the checks above (before the cutoff), labelled
+  `MANUAL_ENTRY_CHECKED`, with `sessionsSource: USER_PROVIDED`. Otherwise it is unpriced (basis `NONE`, P&L `DATA_INSUFFICIENT`).
 - **Phase 1B.1 (D2):** an earlier monitored bid is **never** used as the exit price. If one exists it is kept on the exit record as `staleReference`,
   labelled *historical reference only*, and it is not used for P&L. (Phase 1B priced such closures from it with basis `LAST_VALID_MONITOR_BID`; that basis is no longer produced.)
 - Lifecycle state (`PAPER_EXPIRED` / `PAPER_AUTO_CLOSED`), valuation status and P&L status are separate fields.
 
 ## Journal events
 
-`REVIEW_STARTED`, `REJECTED_DATA_INSUFFICIENT`, `TRADE_OPENED`, `MONITOR_SNAPSHOT`, `EXIT_REJECTED_DATA_INSUFFICIENT`, `CONFIRM_REJECTED_QUOTE` (Phase 1B.1), `TRADE_EXITED`, `TRADE_EXPIRED`, `TRADE_AUTO_CLOSED`.
+`REVIEW_STARTED`, `REJECTED_DATA_INSUFFICIENT`, `TRADE_OPENED`, `MONITOR_SNAPSHOT`, `EXIT_REJECTED_DATA_INSUFFICIENT`, `CONFIRM_REJECTED_QUOTE` (Phase 1B.1), `TRADE_EXITED`, `TRADE_EXPIRED`, `TRADE_AUTO_CLOSED`,
+and from Phase 1B.2 `CONFIRM_REJECTED_EXPIRED`, `EXIT_REJECTED_EXPIRED` and `EXIT_REJECTED_QUOTE` (an exit price that is too old or future-dated).
 Events are append-only with strictly increasing sequence numbers. A refused exit (missing bid) is journaled and the trade stays `PAPER_OPEN`.
 
 ## API (all under `/api/paper`; JSON only)
 
 | Method and path | Purpose | Notable refusals |
 |---|---|---|
-| `POST /assess` | Evaluate a candidate. Stores nothing. | 400 invalid |
-| `POST /review` | Store a `PAPER_REVIEW` trade (201). | 422 `DATA_INSUFFICIENT` (stored as a final record) |
-| `POST /trades/:id/confirm` | Open it. Body `{ "confirmed": true, "quotes": [fresh quotes with asOf] }`. | 400 `CONFIRMATION_REQUIRED` / `INVALID_REQUEST` (wrong instrument); 422 `QUOTE_NOT_FRESH` / `DATA_INSUFFICIENT` / `CAPITAL_GATE_FAILED` / `LOTS_UNRESOLVED`; 409 wrong state |
-| `POST /trades/:id/monitor` | Record current prices, risk and unrealized P&L. | 400 bad `asOf`; 409 if not `PAPER_OPEN` |
-| `POST /trades/:id/exit` | Exit at valid bids. | 400 bad `asOf`; 422 `DATA_INSUFFICIENT` (trade stays open) |
-| `POST /trades/:id/safety-check` | Apply expiry / holding-limit rules on server time. | 400 bad `asOf`; 409 if not `PAPER_OPEN` |
+| `POST /assess` | Evaluate a candidate. Stores nothing. | 400 invalid; 409 `CONTRACT_EXPIRED` |
+| `POST /review` | Store a `PAPER_REVIEW` trade (201). | 422 `DATA_INSUFFICIENT` (stored as a final record); 409 `CONTRACT_EXPIRED` |
+| `POST /trades/:id/confirm` | Open it. Body `{ "confirmed": true, "quotes": [fresh quotes with asOf] }`. | 400 `CONFIRMATION_REQUIRED` / `INVALID_REQUEST` (wrong instrument); 422 `QUOTE_NOT_FRESH` / `DATA_INSUFFICIENT` / `CAPITAL_GATE_FAILED` / `LOTS_UNRESOLVED`; 409 wrong state or `CONTRACT_EXPIRED` |
+| `POST /trades/:id/monitor` | Record current prices (bid, ask and `asOf` per leg), risk and unrealized P&L. | 400 bad `asOf` / foreign instrument; 409 if not `PAPER_OPEN` or `CONTRACT_EXPIRED` |
+| `POST /trades/:id/exit` | Exit at checked manual prices (bid, ask and `asOf` per leg). | 400 bad `asOf` / foreign instrument; 409 `CONTRACT_EXPIRED`; 422 `DATA_INSUFFICIENT` / `QUOTE_NOT_FRESH` (trade stays open) |
+| `POST /trades/:id/safety-check` | Apply expiry / holding-limit rules on server time. | 400 bad `asOf` / foreign instrument; 409 if not `PAPER_OPEN` |
 | `GET /trades?state=&risk=` | List; `risk` is `ALL`, `LOW`, `MEDIUM` or `HIGH`. | 400 bad filter |
 | `GET /trades/:id` | One trade and its events. | 404 |
 | `GET /journal?tradeId=` | Events. | |
@@ -172,13 +226,18 @@ operations run one at a time; corrupt or unsupported data is **an error and is n
 > It is **not guaranteed durable storage**. It must **not** be relied on on **serverless or ephemeral hosting** (including Bolt-style or similar environments),
 > where the filesystem can be reset or discarded between requests. Treat anything held only on such a filesystem as temporary.
 
+### Rollback warning (Phase 1B.2)
+
+Do **not** run an older build (Phase 1B or 1B.1) against a journal written by Phase 1B.2. Older builds do not know the new event types, fields or the
+`MANUAL_ENTRY_CHECKED` status and may refuse or misread the file. **Take a JSON export (or copy `data/paper-journal.json`) before any rollback**, and keep it (D7).
+
 ### Backups: JSON export
 
 `GET /api/paper/export` (the **Export journal** link on the Paper Trading page, Journal tab) downloads the complete journal (trades, entry snapshots and events) as plain JSON,
 stamped with the export time and a durability notice. Take an export regularly. A future store (a database, a hosted store) replaces only
 the repository implementation; the paper-trading domain does not change.
 
-## What Phase 1B does not do
+## What Phase 1B (including 1B.1 and 1B.2) does not do
 
 No broker, no live market data, no scanner, no calculation of Score / Expected Move / Implied Move / Expected Net Edge, no live orders, no authentication,
 no multi-user separation, no automatic paper entry. Legacy `niftyAiTrader.*` storage and old Upstox paper trades are never read or imported.

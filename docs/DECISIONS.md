@@ -27,7 +27,29 @@ Each numbered item shows its status. Items marked **DECIDED** were settled by th
    - **D3 Timestamps:** client times are untrusted (format, ordering and skew are validated); expiry and safety use server time.
    - **D4 Expiry timezone:** expiry dates are judged in Asia/Kolkata; the documented convention (expiry day not expired; expired from 00:00 IST the next day) is unchanged.
    - **D5 Lot count:** no implicit one-lot assumption in risk inputs.
-   - The allowed clock skew (5 s) was not specified; it is a DEFAULT awaiting owner review.
+   - The allowed clock skew (5 s) was not specified; it was a DEFAULT awaiting owner review (replaced by Phase 1B.2 A1).
+
+5. **Phase 1B.2 safety decisions (owner-approved; branch `fix/phase-1b.2-safety` from `b91fa26`).**
+   - **A1** Client-clock tolerance: a time may be up to **30,000 ms** ahead of server time (inclusive).
+   - **A2** Manual monitor, exit and holding-limit prices must have been entered at most **60,000 ms** before the server processes them (inclusive).
+   - **A3** Expiry cutoff: **15:30 Asia/Kolkata on the expiry date** (inclusive). Provisional; **not a verified exchange calendar** (no holidays, special sessions or changed hours).
+   - **A4** Expiry closure: basis `NONE`, P&L `DATA_INSUFFICIENT`. No settlement price is invented.
+   - **A5** Holding-limit closure: priced only from validated manual prices before the cutoff (`MANUAL_ENTRY_CHECKED`), otherwise unpriced.
+   - **A6** `CONTRACT_EXPIRED` maps to HTTP **409**.
+   - **A7** No new lifecycle state. An expired review stays `PAPER_REVIEW`; its derived expiry status is `EXPIRED_REVIEW`.
+   - **A8** An invalid monitor price records a `DATA_INSUFFICIENT` snapshot and never replaces the last valid bids.
+   - **A9** Valuation label `MANUAL_ENTRY_CHECKED`: only the application's manual-input rules passed; never exchange-verified.
+   - **A10** Derived `priceQuality` on responses and in the UI; the raw journal export is unchanged; no enriched export without approval.
+   - **A11** Only tests whose expected behaviour intentionally changed are rewritten.
+   - **A12** `assess` is also gated by the cutoff.
+   - **A13** Branch from `b91fa26`; Phase 1B.1 is not merged first.
+   - **D1** A quote for an instrument that is not a leg of the trade is `INVALID_REQUEST` on monitor, exit and safety check.
+   - **D2** Derived fields are on every trade-returning response, including monitor and exit.
+   - **D3** `expiryStatus` is derived, never stored.
+   - **D4** Price-quality classification never infers exchange verification; ambiguous records are not upgraded.
+   - **D7** Older builds must not be run against a Phase 1B.2 journal; a backup is required before any rollback.
+   - **D8** Names as proposed, plus `PROVENANCE_INCOMPLETE`, `PROVENANCE_INCONSISTENT` and `priceQuality.note`.
+   - **D9** Tests are kept with the implementation when a test-only commit would not compile.
 
 ## Open notes and known limitations (Phase 1B)
 
@@ -36,8 +58,8 @@ Each numbered item shows its status. Items marked **DECIDED** were settled by th
 - **A zero or negative bid is treated as "no price"**, not as a price of zero. A genuinely worthless option at expiry therefore records `DATA_INSUFFICIENT` P&L rather than an assumed zero. Revisit if you would rather record zero.
 - **Discarding a reviewed candidate has no state.** A `PAPER_REVIEW` trade that is never confirmed simply stays in review. No state was invented for it.
 - **Completed sessions and trading days to expiry are supplied by the user**, because no trading calendar exists. The holding limit is "not evaluated" when they are absent.
-- **The expiry day itself is not treated as expired**, because market hours are not configured. Since Phase 1B.1 the date is taken in Asia/Kolkata, on server time.
-- **Exit, monitor and safety quotes carry no freshness check of their own** (Phase 1B.1 applied the 60-second rule to confirmation only, as approved). Their event time is validated (D3), but a typed bid is accepted as current at that time.
+- **Expiry cutoff is provisional.** Since Phase 1B.2 a contract expires at 15:30 Asia/Kolkata on its expiry date (server time). There is no exchange holiday or session calendar.
+- **Manual prices are checked, not verified.** Since Phase 1B.2 monitor, exit and holding-limit prices need a bid, an ask and a user-entry time within 60 s; this proves only that the input rules passed (`MANUAL_ENTRY_CHECKED`), not that the prices came from the exchange.
 - **Phase 1A contracts for paper trades and the journal (`PaperTrade`, `PaperTradeStatus`, `JournalStore`) are unchanged and now unused**, beside the Phase 1B types. Retire them in a deliberate re-freeze rather than editing a frozen contract.
 - **The web app repeats the 3-line risk-filter rule**, because it may import only `@nsest/core/contracts` (types and constants). A web test mirrors the core test cases.
 - **The "Not available in Phase 1A" notice** is kept on the live-scanning sections (the scanner genuinely does not exist), because a frozen test asserts that text.

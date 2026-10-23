@@ -5,11 +5,31 @@ export const TIME_RULES = {
   /** D1 (approved): a quote older than this at confirmation is stale. Owner decision, 60 seconds. */
   maxQuoteAgeMs: 60_000,
   /**
-   * D3: how far a client time may be AHEAD of the server clock (allowed clock skew). Anything later is rejected as
-   * future-dated. Provenance: DEFAULT engineering value (no source in the specification); flagged for owner review.
+   * Phase 1B.2 (A1, approved): how far a client time may be AHEAD of the server clock. This is a CLIENT-CLOCK tolerance,
+   * not exchange-time verification. A time up to this far ahead is accepted; anything later is rejected as future-dated.
+   * (Phase 1B.1 used a 5 000 ms default.)
    */
-  maxFutureSkewMs: 5_000,
+  maxFutureSkewMs: 30_000,
+  /**
+   * Phase 1B.2 (A2, approved): the maximum time since MANUAL ENTRY for monitor, exit and holding-limit prices. A price
+   * entered up to this long before the server processes it is accepted; older is refused. It measures when the user typed
+   * the price, never how fresh the market was.
+   */
+  maxManualPriceAgeMs: 60_000,
 } as const;
+
+/**
+ * Phase 1B.2: checks one price's user-entry time against the server clock. Returns null when acceptable, otherwise the
+ * problem. Boundaries are inclusive: exactly maxAgeMs old, or exactly maxFutureSkewMs ahead, is accepted.
+ */
+export function checkEntryTime(asOf: string | undefined, nowMs: number, maxAgeMs: number, what: string): { ms: number; problem: null } | { ms: null; problem: string } {
+  if (asOf === undefined) return { ms: null, problem: `${what} has no time (asOf); its freshness cannot be checked` };
+  const ms = parseStrictTimestamp(asOf);
+  if (ms === null) return { ms: null, problem: `${what} time "${asOf}" must be a full timestamp with a zone` };
+  if (ms > nowMs + TIME_RULES.maxFutureSkewMs) return { ms: null, problem: `${what} time ${asOf} is in the future (server time ${new Date(nowMs).toISOString()}, allowed client-clock tolerance ${TIME_RULES.maxFutureSkewMs / 1000} s)` };
+  if (nowMs - ms > maxAgeMs) return { ms: null, problem: `${what} is older than ${maxAgeMs / 1000} s (time ${asOf}, age ${Math.round((nowMs - ms) / 1000)} s)` };
+  return { ms, problem: null };
+}
 
 /**
  * A full timestamp with an explicit zone: YYYY-MM-DDTHH:MM[:SS[.fff]] followed by Z or +HH:MM / -HH:MM.
@@ -46,7 +66,7 @@ export function checkEventTime(asOf: string, ctx: { nowMs: number; notBefore: st
   if (ms === null) return [`asOf "${asOf}" must be a full timestamp with a zone, e.g. 2026-10-01T10:00:00+05:30`];
   const problems: string[] = [];
   if (ms > ctx.nowMs + TIME_RULES.maxFutureSkewMs) {
-    problems.push(`asOf ${asOf} is in the future (server time ${new Date(ctx.nowMs).toISOString()}, allowed skew ${TIME_RULES.maxFutureSkewMs / 1000} s)`);
+    problems.push(`asOf ${asOf} is in the future (server time ${new Date(ctx.nowMs).toISOString()}, allowed client-clock tolerance ${TIME_RULES.maxFutureSkewMs / 1000} s)`);
   }
   const floor = Date.parse(ctx.notBefore);
   if (!Number.isNaN(floor) && ms < floor) problems.push(`asOf ${asOf} is before ${ctx.notBeforeLabel} (${ctx.notBefore})`);

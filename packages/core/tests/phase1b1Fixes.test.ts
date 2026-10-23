@@ -12,7 +12,7 @@ import {
   istDateOf,
   parseCandidateInput,
 } from "../src/index.js";
-import { CE_ID, PE_ID, T0, confirmBody, exitQuotes, freshQuotes, longVolRaw, makeService, opened, reviewed } from "./fixtures.js";
+import { CE_ID, PE_ID, T0, confirmBody, atEntryTime, exitQuotes, freshQuotes, longVolRaw, makeService, opened, reviewed } from "./fixtures.js";
 
 type Res<T> = { ok: true; value: T } | { ok: false; error: { code: string; message: string; details?: string[]; trade?: PaperTradeRecord } };
 const ok = <T>(r: Res<T>): T => {
@@ -36,11 +36,13 @@ describe("D1: quote freshness at confirmation (max 60 s, trusted server time)", 
   });
 
   it.each([5, 10])("a review-time quote re-sent %i days later is rejected (QUOTE_NOT_FRESH); the trade stays in review and nothing is opened", async (days) => {
+    // Phase 1B.2: a later expiry, so the contract is still live 10 days on (before its 15:30 IST cutoff) and only freshness is tested.
+    const raw = longVolRaw({ expiry: "2026-10-27" });
     const svc = makeService();
     const reviewTime = svc.clock.peek();
-    const id = await reviewed(svc);
+    const id = await reviewed(svc, raw);
     svc.clock.advance(days * DAY);
-    const e = err(await svc.service.confirm(id, { confirmed: true, quotes: freshQuotes(longVolRaw(), reviewTime) }));
+    const e = err(await svc.service.confirm(id, { confirmed: true, quotes: freshQuotes(raw, reviewTime) }));
     expect(e.code).toBe("QUOTE_NOT_FRESH");
     expect(e.details?.join(" ")).toMatch(/older than 60 s/);
     const t = ok(await svc.service.getTrade(id)).trade;
@@ -196,7 +198,7 @@ describe("D2: expiry / safety closure without executable bids is DATA_INSUFFICIE
     const svc = makeService();
     const id = await opened(svc);
     if (monitorAt !== null) svc.clock.set(monitorAt);
-    const monitored = ok(await svc.service.monitor(id, exitQuotes()));
+    const monitored = ok(await svc.service.monitor(id, atEntryTime(exitQuotes(), svc.clock.peek())));
     expect(monitored.lastValidExit?.exitPremium).toBe(120.05);
     svc.clock.set("2026-10-07T03:50:00Z"); // 09:20 IST on the day after expiry (server time)
     const r = ok(await svc.service.runSafetyCheck(id, {}));
@@ -215,20 +217,23 @@ describe("D2: expiry / safety closure without executable bids is DATA_INSUFFICIE
   it("the holding-limit closure follows the same rule: no current bid -> DATA_INSUFFICIENT even with an earlier monitored bid", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    ok(await svc.service.monitor(id, exitQuotes()));
+    ok(await svc.service.monitor(id, atEntryTime(exitQuotes(), svc.clock.peek())));
     const r = ok(await svc.service.runSafetyCheck(id, { completedSessions: 2 }));
     expect(r.trade.state).toBe("PAPER_AUTO_CLOSED");
     expect(r.trade.exit).toMatchObject({ basis: "NONE", exitPremium: null, valuationStatus: "DATA_INSUFFICIENT" });
     expect(r.trade.realizedPnl?.status).toBe("DATA_INSUFFICIENT");
   });
 
-  it("with valid CURRENT CE and PE bids, expiry is valued from them (unchanged) and marked EXECUTABLE_QUOTE", async () => {
+  // Phase 1B.2 (A4) intentionally reverses this test: it previously expected an expiry closure to be PRICED from bids
+  // typed at closure time (valuation EXECUTABLE_QUOTE, P&L VALID). An expiry closure only runs at or after the contract's
+  // cutoff, and there is no approved settlement-price source, so typed bids are not used.
+  it("with valid-looking CE and PE bids typed at closure, an expiry is NOT valued from them (Phase 1B.2, A4)", async () => {
     const svc = makeService();
     const id = await opened(svc);
     svc.clock.set("2026-10-07T03:50:00Z");
-    const r = ok(await svc.service.runSafetyCheck(id, exitQuotes()));
-    expect(r.trade.exit).toMatchObject({ basis: "CURRENT_QUOTE", exitPremium: 120.05, valuationStatus: "EXECUTABLE_QUOTE", staleReference: null });
-    expect(r.trade.realizedPnl).toMatchObject({ status: "VALID", grossPnl: -45.5 });
+    const r = ok(await svc.service.runSafetyCheck(id, atEntryTime(exitQuotes(), svc.clock.peek())));
+    expect(r.trade.exit).toMatchObject({ basis: "NONE", exitPremium: null, valuationStatus: "DATA_INSUFFICIENT", staleReference: null });
+    expect(r.trade.realizedPnl).toMatchObject({ status: "DATA_INSUFFICIENT", grossPnl: null });
   });
 
   it("lifecycle state, valuation status and P&L validity are separate fields", async () => {
@@ -245,7 +250,7 @@ describe("D3: client timestamps are untrusted (format, ordering, skew); safety u
   it("an exit timestamped before the entry snapshot is rejected and the trade stays open", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    const e = err(await svc.service.exit(id, { ...exitQuotes(), asOf: "2026-09-01T10:00:00+05:30" }));
+    const e = err(await svc.service.exit(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: "2026-09-01T10:00:00+05:30" }));
     expect(e.code).toBe("INVALID_REQUEST");
     expect(e.details?.join(" ")).toMatch(/before/);
     const t = ok(await svc.service.getTrade(id)).trade;
@@ -258,21 +263,21 @@ describe("D3: client timestamps are untrusted (format, ordering, skew); safety u
     const id = await opened(svc);
     svc.clock.advance(10 * 60_000);
     const later = shift(svc.clock.peek(), -1000);
-    ok(await svc.service.monitor(id, { ...exitQuotes(), asOf: later }));
-    expect(err(await svc.service.monitor(id, { ...exitQuotes(), asOf: shift(later, -60_000) })).code).toBe("INVALID_REQUEST");
+    ok(await svc.service.monitor(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: later }));
+    expect(err(await svc.service.monitor(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: shift(later, -60_000) })).code).toBe("INVALID_REQUEST");
   });
 
   it("a materially future-dated exit is rejected; one within the allowed skew is accepted", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    expect(err(await svc.service.exit(id, { ...exitQuotes(), asOf: shift(svc.clock.peek(), 10 * 60_000) })).code).toBe("INVALID_REQUEST");
-    expect(ok(await svc.service.exit(id, { ...exitQuotes(), asOf: shift(svc.clock.peek(), 1000) })).state).toBe("PAPER_EXITED");
+    expect(err(await svc.service.exit(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: shift(svc.clock.peek(), 10 * 60_000) })).code).toBe("INVALID_REQUEST");
+    expect(ok(await svc.service.exit(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: shift(svc.clock.peek(), 1000) })).state).toBe("PAPER_EXITED");
   });
 
   it.each(["not a date", "2026-02-30T10:00:00Z", "2026-10-01", "2026-10-01T10:00:00"])("an invalid or ambiguous event time (%s) is rejected", async (asOf) => {
     const svc = makeService();
     const id = await opened(svc);
-    expect(err(await svc.service.exit(id, { ...exitQuotes(), asOf })).code).toBe("INVALID_REQUEST");
+    expect(err(await svc.service.exit(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf })).code).toBe("INVALID_REQUEST");
   });
 
   it("a client-supplied future asOf can NOT force expiry: it is rejected, and the trade stays open", async () => {
@@ -303,9 +308,11 @@ describe("D3: client timestamps are untrusted (format, ordering, skew); safety u
 
 // ---------------------------------------------------------------------------------------------------------------
 describe("D4: expiry dates are judged in Asia/Kolkata (IST), never by slicing an ISO string", () => {
-  it("documents the convention: IST, and expired from 00:00 IST on the day after the expiry date", () => {
+  // Phase 1B.2 (A3) intentionally changes the documented convention: expired from the provisional 15:30 IST cutoff on the
+  // expiry date (previously 00:00 IST on the next day). The time zone (D4) is unchanged.
+  it("documents the convention: IST, and expired from the provisional 15:30 IST cutoff on the expiry date", () => {
     expect(EXPIRY_CONVENTION.timeZone).toBe("Asia/Kolkata");
-    expect(EXPIRY_CONVENTION.expiredFrom).toMatch(/00:00 Asia\/Kolkata on the calendar day after/);
+    expect(EXPIRY_CONVENTION.expiredFrom).toMatch(/15:30 Asia\/Kolkata on the expiry date/);
   });
 
   it.each([
@@ -319,10 +326,10 @@ describe("D4: expiry dates are judged in Asia/Kolkata (IST), never by slicing an
 
   const base = { expiry: "2026-10-06", completedSessions: null as number | null };
   it.each([
-    ["2026-10-06T18:29:59Z", "NONE"], // last second of expiry day in IST
+    ["2026-10-06T18:29:59Z", "EXPIRE"], // last second of expiry day in IST: after the 15:30 cutoff (Phase 1B.2, A3; was NONE)
     ["2026-10-06T18:30:00Z", "EXPIRE"], // first second of the next IST day
     ["2026-10-06T22:30:00Z", "EXPIRE"], // P5: UTC date says expiry day, IST says the day after
-    ["2026-10-07T01:00:00+09:00", "NONE"], // written date is the 7th, but it is still the 6th in IST
+    ["2026-10-07T01:00:00+09:00", "EXPIRE"], // written date is the 7th; 21:30 IST on the 6th, after the cutoff (Phase 1B.2, A3; was NONE)
     ["2026-10-06T10:00:00+05:30", "NONE"],
     ["2026-10-07T09:20:00+05:30", "EXPIRE"],
   ])("evaluateSafety at %s -> %s", (asOf, action) => expect(evaluateSafety({ ...base, asOf }).action).toBe(action));
@@ -391,7 +398,7 @@ describe("R2: authoritative lifecycle and journal times are SERVER time; a toler
     const id = await opened(svc);
     const serverAt = svc.clock.peek();
     const clientAt = shift(serverAt, SKEW_OK);
-    const t = ok(await svc.service.monitor(id, { ...exitQuotes(), asOf: clientAt }));
+    const t = ok(await svc.service.monitor(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: clientAt }));
     expect(t.updatedAt).toBe(serverAt);
     expect(t.lastMonitor?.asOf).toBe(serverAt);
     expect(t.lastMonitor?.clientAsOf).toBe(clientAt);
@@ -405,7 +412,7 @@ describe("R2: authoritative lifecycle and journal times are SERVER time; a toler
     const id = await opened(svc);
     const serverAt = svc.clock.peek();
     const clientAt = shift(serverAt, SKEW_OK);
-    const t = ok(await svc.service.exit(id, { ...exitQuotes(), asOf: clientAt }));
+    const t = ok(await svc.service.exit(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: clientAt }));
     expect(t.state).toBe("PAPER_EXITED");
     expect(t.updatedAt).toBe(serverAt);
     // R4: server processing time is the event time only; no quote-observation time exists, so priceAsOf is null.
@@ -419,7 +426,7 @@ describe("R2: authoritative lifecycle and journal times are SERVER time; a toler
     const id = await opened(svc);
     const serverAt = svc.clock.peek();
     const clientAt = shift(serverAt, SKEW_OK);
-    expect(err(await svc.service.exit(id, { ...exitQuotes(66.05, null), asOf: clientAt })).code).toBe("DATA_INSUFFICIENT");
+    expect(err(await svc.service.exit(id, { ...atEntryTime(exitQuotes(66.05, null), svc.clock.peek()), asOf: clientAt })).code).toBe("DATA_INSUFFICIENT");
     const ev = (await svc.service.listEvents({ tradeId: id })).at(-1);
     expect(ev).toMatchObject({ type: "EXIT_REJECTED_DATA_INSUFFICIENT", timestamp: serverAt, payload: { clientAsOf: clientAt } });
   });
@@ -427,20 +434,20 @@ describe("R2: authoritative lifecycle and journal times are SERVER time; a toler
   it("after a tolerated future client asOf, a normal event at the current server time is NOT rejected", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    ok(await svc.service.monitor(id, { ...exitQuotes(), asOf: shift(svc.clock.peek(), SKEW_OK) }));
+    ok(await svc.service.monitor(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: shift(svc.clock.peek(), SKEW_OK) }));
     // A client stamping the current server time (earlier than its previous, tolerated future stamp) is accepted.
-    ok(await svc.service.monitor(id, { ...exitQuotes(), asOf: svc.clock.peek() }));
+    ok(await svc.service.monitor(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: svc.clock.peek() }));
     // And a request with no client time at all is accepted.
-    ok(await svc.service.monitor(id, exitQuotes()));
-    expect(ok(await svc.service.exit(id, { ...exitQuotes(), asOf: svc.clock.peek() })).state).toBe("PAPER_EXITED");
+    ok(await svc.service.monitor(id, atEntryTime(exitQuotes(), svc.clock.peek())));
+    expect(ok(await svc.service.exit(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: svc.clock.peek() })).state).toBe("PAPER_EXITED");
   });
 
   it("client times are still validated: before the last update, beyond the skew, or malformed are rejected", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    expect(err(await svc.service.monitor(id, { ...exitQuotes(), asOf: shift(svc.clock.peek(), -60 * 60_000) })).code).toBe("INVALID_REQUEST");
-    expect(err(await svc.service.exit(id, { ...exitQuotes(), asOf: shift(svc.clock.peek(), TIME_RULES.maxFutureSkewMs + 60_000) })).code).toBe("INVALID_REQUEST");
-    expect(err(await svc.service.exit(id, { ...exitQuotes(), asOf: "2026-09-28" })).code).toBe("INVALID_REQUEST");
+    expect(err(await svc.service.monitor(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: shift(svc.clock.peek(), -60 * 60_000) })).code).toBe("INVALID_REQUEST");
+    expect(err(await svc.service.exit(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: shift(svc.clock.peek(), TIME_RULES.maxFutureSkewMs + 60_000) })).code).toBe("INVALID_REQUEST");
+    expect(err(await svc.service.exit(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: "2026-09-28" })).code).toBe("INVALID_REQUEST");
     expect(ok(await svc.service.getTrade(id)).trade.state).toBe("PAPER_OPEN");
   });
 
@@ -498,9 +505,9 @@ describe("R4: server processing time is never presented as a quote-observation t
     const svc = makeService();
     const id = await opened(svc);
     const serverAt = svc.clock.peek();
-    const t = ok(await svc.service.exit(id, exitQuotes()));
+    const t = ok(await svc.service.exit(id, atEntryTime(exitQuotes(), svc.clock.peek())));
     expect(t.state).toBe("PAPER_EXITED");
-    expect(t.exit).toMatchObject({ trigger: "USER_EXIT", basis: "CURRENT_QUOTE", timestamp: serverAt, priceAsOf: null, exitPremium: 120.05, valuationStatus: "EXECUTABLE_QUOTE" });
+    expect(t.exit).toMatchObject({ trigger: "USER_EXIT", basis: "CURRENT_QUOTE", timestamp: serverAt, priceAsOf: null, exitPremium: 120.05, valuationStatus: "MANUAL_ENTRY_CHECKED" });
     expect(t.realizedPnl).toMatchObject({ status: "VALID", grossPnl: -45.5 });
   });
 
@@ -508,29 +515,40 @@ describe("R4: server processing time is never presented as a quote-observation t
     const svc = makeService();
     const id = await opened(svc);
     const clientAt = shift(svc.clock.peek(), 1000);
-    const t = ok(await svc.service.exit(id, { ...exitQuotes(), asOf: clientAt }));
+    const t = ok(await svc.service.exit(id, { ...atEntryTime(exitQuotes(), svc.clock.peek()), asOf: clientAt }));
     expect(t.exit?.priceAsOf).toBeNull();
     expect(t.exit?.clientAsOf).toBe(clientAt);
   });
 
+  // Phase 1B.2 (A4): the "expiry closure" row was removed from this table because an expiry closure is no longer priced
+  // from typed bids. Its replacement is the test directly below; the holding-limit row is unchanged.
   it.each([
     ["holding-limit closure", "2026-10-01T09:30:00Z", { completedSessions: 2 }, "PAPER_AUTO_CLOSED"],
-    ["expiry closure", "2026-10-07T03:50:00Z", {}, "PAPER_EXPIRED"],
   ] as const)("%s at current valid bids: priceAsOf = null, event time = server time, P&L VALID (unchanged)", async (_n, at, extra, state) => {
     const svc = makeService();
     const id = await opened(svc);
     svc.clock.set(at);
-    const r = ok(await svc.service.runSafetyCheck(id, { ...extra, ...exitQuotes() }));
+    const r = ok(await svc.service.runSafetyCheck(id, { ...extra, ...atEntryTime(exitQuotes(), svc.clock.peek()) }));
     expect(r.trade.state).toBe(state);
     expect(r.trade.exit).toMatchObject({ basis: "CURRENT_QUOTE", timestamp: at, priceAsOf: null, exitPremium: 120.05 });
     expect(r.trade.realizedPnl).toMatchObject({ status: "VALID", grossPnl: -45.5 });
+  });
+
+  it("expiry closure with typed bids: priceAsOf = null, event time = server time, P&L DATA_INSUFFICIENT (Phase 1B.2, A4)", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    svc.clock.set("2026-10-07T03:50:00Z");
+    const r = ok(await svc.service.runSafetyCheck(id, atEntryTime(exitQuotes(), svc.clock.peek())));
+    expect(r.trade.state).toBe("PAPER_EXPIRED");
+    expect(r.trade.exit).toMatchObject({ basis: "NONE", timestamp: "2026-10-07T03:50:00Z", priceAsOf: null, exitPremium: null });
+    expect(r.trade.realizedPnl).toMatchObject({ status: "DATA_INSUFFICIENT", grossPnl: null });
   });
 
   it("the last valid monitored bids carry the SERVER time the monitor update was recorded, and the closure note says so", async () => {
     const svc = makeService();
     const id = await opened(svc);
     const recordedAt = svc.clock.peek();
-    const m = ok(await svc.service.monitor(id, exitQuotes()));
+    const m = ok(await svc.service.monitor(id, atEntryTime(exitQuotes(), svc.clock.peek())));
     expect(m.lastValidExit?.asOf).toBe(recordedAt);
     expect(m.lastMonitor?.asOf).toBe(recordedAt);
     svc.clock.set("2026-10-07T03:50:00Z");

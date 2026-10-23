@@ -353,17 +353,29 @@ describe("Paper Trading: open trade", () => {
     expect(screen.getAllByText("PAPER_OPEN").length).toBeGreaterThan(0);
   });
 
+  // Phase 1B.2 (A2, HIGH-2) intentionally changes the expected body: the exit form now also sends each leg's ask and
+  // its manual-entry time. The point of this test (EXACT stored identities, typed values) is unchanged.
   it("monitor and exit send the EXACT stored instrument identities with the typed bids", async () => {
     const calls = setup(open, { [`POST /api/paper/trades/${open.tradeId}/exit`]: () => ({ body: open }) });
     await openIt();
-    fireEvent.change(await screen.findByLabelText("Exit: CE 22900 bid"), { target: { value: "66.05" } });
-    setField("Exit: PE 22800 bid", "54");
-    fireEvent.click(await screen.findByRole("button", { name: "Exit paper trade" }));
-    await waitFor(() => expect(posts(calls, "/exit")).toHaveLength(1));
+    await screen.findByLabelText("Exit: CE 22900 bid");
+    const typedAt = "2026-10-01T05:00:00.000Z";
+    vi.useFakeTimers({ toFake: ["Date"] }); // a fixed, explicit clock for the entry times
+    vi.setSystemTime(new Date(typedAt));
+    try {
+      setField("Exit: CE 22900 bid", "66.05");
+      setField("Exit: CE 22900 ask", "66.55");
+      setField("Exit: PE 22800 bid", "54");
+      setField("Exit: PE 22800 ask", "54.5");
+      fireEvent.click(screen.getByRole("button", { name: "Exit paper trade" }));
+      await waitFor(() => expect(posts(calls, "/exit")).toHaveLength(1));
+    } finally {
+      vi.useRealTimers();
+    }
     expect(posts(calls, "/exit")[0]?.body).toEqual({
       quotes: [
-        { instrument: { provider: "manual", id: "NIFTY|2026-10-06|CE|22900" }, bid: 66.05 },
-        { instrument: { provider: "manual", id: "NIFTY|2026-10-06|PE|22800" }, bid: 54 },
+        { instrument: { provider: "manual", id: "NIFTY|2026-10-06|CE|22900" }, bid: 66.05, ask: 66.55, asOf: typedAt },
+        { instrument: { provider: "manual", id: "NIFTY|2026-10-06|PE|22800" }, bid: 54, ask: 54.5, asOf: typedAt },
       ],
       exitCosts: null,
     });

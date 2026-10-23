@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { PaperTradeRecord } from "../src/index.js";
-import { CE_ID, PE_ID, confirmBody, exitQuotes, longVolRaw, makeService, opened, reviewed } from "./fixtures.js";
+import { CE_ID, PE_ID, confirmBody, atEntryTime, exitQuotes, longVolRaw, makeService, opened, reviewed } from "./fixtures.js";
 
 const ok = <T>(r: { ok: true; value: T } | { ok: false; error: unknown }): T => {
   if (!r.ok) throw new Error(`expected ok, got ${JSON.stringify(r.error)}`);
@@ -110,8 +110,8 @@ describe("PAPER_REVIEW -> PAPER_OPEN requires explicit confirmation", () => {
   it("monitoring, exiting or safety-checking a trade that is only in REVIEW is refused", async () => {
     const svc = makeService();
     const id = await reviewed(svc);
-    expect(err(await svc.service.monitor(id, exitQuotes())).code).toBe("INVALID_TRANSITION");
-    expect(err(await svc.service.exit(id, exitQuotes())).code).toBe("INVALID_TRANSITION");
+    expect(err(await svc.service.monitor(id, atEntryTime(exitQuotes(), svc.clock.peek()))).code).toBe("INVALID_TRANSITION");
+    expect(err(await svc.service.exit(id, atEntryTime(exitQuotes(), svc.clock.peek()))).code).toBe("INVALID_TRANSITION");
     expect(err(await svc.service.runSafetyCheck(id, {})).code).toBe("INVALID_TRANSITION");
   });
 
@@ -247,7 +247,7 @@ describe("entry risk is preserved separately from current risk", () => {
   it("lists what was carried from entry (strategy outputs and capital), for transparency", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    const after = ok(await svc.service.monitor(id, exitQuotes(66.05, 54, { tradingDaysToExpiry: 7, spot: 22831.15 })));
+    const after = ok(await svc.service.monitor(id, atEntryTime(exitQuotes(66.05, 54, { tradingDaysToExpiry: 7, spot: 22831.15 }), svc.clock.peek())));
     expect(after.lastMonitor?.carriedFromEntry).toEqual(expect.arrayContaining(["expectedNetEdge", "iv", "rv20", "maxCapitalAllocation", "entryCosts", "lots", "structure", "capitalUtilization"]));
   });
 });
@@ -279,7 +279,7 @@ describe("monitoring and unrealized P&L", () => {
   it("valid bids: unrealized = 65 x (120.05 - 120.75) = -45.50 gross; the last valid exit is recorded", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    const t = ok(await svc.service.monitor(id, exitQuotes()));
+    const t = ok(await svc.service.monitor(id, atEntryTime(exitQuotes(), svc.clock.peek())));
     expect(t.lastMonitor).toMatchObject({ dataStatus: "VALID", currentExitPremium: 120.05 });
     expect(t.lastMonitor?.unrealized).toMatchObject({ status: "VALID", grossPnl: -45.5, netPnl: null, netStatus: "COSTS_UNAVAILABLE" });
     expect(t.lastValidExit?.exitPremium).toBe(120.05);
@@ -289,15 +289,15 @@ describe("monitoring and unrealized P&L", () => {
   it("with exit costs supplied, unrealized net is shown", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    const t = ok(await svc.service.monitor(id, exitQuotes(66.05, 54, { exitCosts: 240 })));
+    const t = ok(await svc.service.monitor(id, atEntryTime(exitQuotes(66.05, 54, { exitCosts: 240 }), svc.clock.peek())));
     expect(t.lastMonitor?.unrealized).toMatchObject({ grossPnl: -45.5, netPnl: -535.5, netStatus: "VALID" });
   });
 
   it("a missing bid -> DATA_INSUFFICIENT; the previous valid exit is kept, not overwritten", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    ok(await svc.service.monitor(id, exitQuotes()));
-    const t = ok(await svc.service.monitor(id, exitQuotes(66.05, null)));
+    ok(await svc.service.monitor(id, atEntryTime(exitQuotes(), svc.clock.peek())));
+    const t = ok(await svc.service.monitor(id, atEntryTime(exitQuotes(66.05, null), svc.clock.peek())));
     expect(t.lastMonitor).toMatchObject({ dataStatus: "DATA_INSUFFICIENT", currentExitPremium: null });
     expect(t.lastMonitor?.unrealized).toMatchObject({ status: "DATA_INSUFFICIENT", grossPnl: null });
     expect(t.lastValidExit?.exitPremium).toBe(120.05);
@@ -306,8 +306,8 @@ describe("monitoring and unrealized P&L", () => {
   it("every monitor update is journaled", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    ok(await svc.service.monitor(id, exitQuotes()));
-    ok(await svc.service.monitor(id, exitQuotes(65, 53)));
+    ok(await svc.service.monitor(id, atEntryTime(exitQuotes(), svc.clock.peek())));
+    ok(await svc.service.monitor(id, atEntryTime(exitQuotes(65, 53), svc.clock.peek())));
     expect(await eventTypes(svc, id)).toEqual(["REVIEW_STARTED", "TRADE_OPENED", "MONITOR_SNAPSHOT", "MONITOR_SNAPSHOT"]);
   });
 });
@@ -316,7 +316,7 @@ describe("PAPER_OPEN -> PAPER_EXITED (P&L from executable bids only)", () => {
   it("exits at CE Bid + PE Bid: realized gross -45.50", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    const t = ok(await svc.service.exit(id, exitQuotes()));
+    const t = ok(await svc.service.exit(id, atEntryTime(exitQuotes(), svc.clock.peek())));
     expect(t.state).toBe("PAPER_EXITED");
     expect(t.exit).toMatchObject({ trigger: "USER_EXIT", basis: "CURRENT_QUOTE", exitPremium: 120.05 });
     expect(t.realizedPnl).toMatchObject({ status: "VALID", grossPnl: -45.5 });
@@ -325,7 +325,7 @@ describe("PAPER_OPEN -> PAPER_EXITED (P&L from executable bids only)", () => {
 
   it("realized net uses both cost figures: gross -45.50 - 250 - 240 = -535.50", async () => {
     const svc = makeService();
-    const t = ok(await svc.service.exit(await opened(svc), exitQuotes(66.05, 54, { exitCosts: 240 })));
+    const t = ok(await svc.service.exit(await opened(svc), atEntryTime(exitQuotes(66.05, 54, { exitCosts: 240 }), svc.clock.peek())));
     expect(t.realizedPnl).toMatchObject({ grossPnl: -45.5, netPnl: -535.5, netStatus: "VALID" });
   });
 
@@ -337,7 +337,7 @@ describe("PAPER_OPEN -> PAPER_EXITED (P&L from executable bids only)", () => {
   ])("%s -> DATA_INSUFFICIENT: the trade stays PAPER_OPEN and no exit price is invented", async (_name, body) => {
     const svc = makeService();
     const id = await opened(svc);
-    const e = err(await svc.service.exit(id, body));
+    const e = err(await svc.service.exit(id, atEntryTime(body, svc.clock.peek())));
     expect(e.code).toBe("DATA_INSUFFICIENT");
     expect(e.trade?.state).toBe("PAPER_OPEN");
     expect(e.trade?.exit).toBeNull();
@@ -353,23 +353,25 @@ describe("PAPER_OPEN -> PAPER_EXITED (P&L from executable bids only)", () => {
     expect(e.trade?.state).toBe("PAPER_OPEN");
   });
 
+  // Phase 1B.2 (D1): a quote for another instrument is refused as INVALID_REQUEST, the same rule as at confirmation
+  // (previously it was silently ignored and the exit failed only because the real legs had no quote).
   it("quotes for another strike or another expiry are not substituted", async () => {
     const svc = makeService();
     const id = await opened(svc);
     const otherStrike = { provider: "manual", id: "NIFTY|2026-10-06|CE|23000" };
     const otherExpiry = { provider: "manual", id: "NIFTY|2026-10-13|PE|22800" };
     const e = err(await svc.service.exit(id, { quotes: [{ instrument: otherStrike, bid: 66.05 }, { instrument: otherExpiry, bid: 54 }] }));
-    expect(e.code).toBe("DATA_INSUFFICIENT");
-    expect(e.details?.join()).toMatch(/no quote supplied for this exact instrument/);
+    expect(e.code).toBe("INVALID_REQUEST");
+    expect(e.details?.join()).toMatch(/not a leg of this trade/);
     expect(e.trade?.state).toBe("PAPER_OPEN");
   });
 
   it("an exited trade is final: a second exit is an INVALID_TRANSITION", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    ok(await svc.service.exit(id, exitQuotes()));
-    expect(err(await svc.service.exit(id, exitQuotes())).code).toBe("INVALID_TRANSITION");
-    expect(err(await svc.service.monitor(id, exitQuotes())).code).toBe("INVALID_TRANSITION");
+    ok(await svc.service.exit(id, atEntryTime(exitQuotes(), svc.clock.peek())));
+    expect(err(await svc.service.exit(id, atEntryTime(exitQuotes(), svc.clock.peek()))).code).toBe("INVALID_TRANSITION");
+    expect(err(await svc.service.monitor(id, atEntryTime(exitQuotes(), svc.clock.peek()))).code).toBe("INVALID_TRANSITION");
   });
 });
 
@@ -406,7 +408,7 @@ describe("expiry and safety closure (deterministic; no invented prices)", () => 
   it("EXPIRY with only an earlier monitored bid: PAPER_EXPIRED, NOT priced from it; P&L DATA_INSUFFICIENT; bid kept as reference only", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    ok(await svc.service.monitor(id, exitQuotes()));
+    ok(await svc.service.monitor(id, atEntryTime(exitQuotes(), svc.clock.peek())));
     svc.clock.set("2026-10-07T03:50:00Z"); // 09:20 IST, the day after expiry (server time)
     const r = ok(await svc.service.runSafetyCheck(id, {}));
     expect(r.decision.action).toBe("EXPIRE");
@@ -432,7 +434,7 @@ describe("expiry and safety closure (deterministic; no invented prices)", () => 
   it("EXPIRY after only an INVALID monitor update still has no price (an invalid snapshot is never promoted)", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    ok(await svc.service.monitor(id, exitQuotes(66.05, null)));
+    ok(await svc.service.monitor(id, atEntryTime(exitQuotes(66.05, null), svc.clock.peek())));
     svc.clock.set("2026-10-07T03:50:00Z");
     const r = ok(await svc.service.runSafetyCheck(id, {}));
     expect(r.trade.exit?.basis).toBe("NONE");
@@ -443,7 +445,7 @@ describe("expiry and safety closure (deterministic; no invented prices)", () => 
     const svc = makeService();
     const id = await opened(svc);
     svc.clock.set("2026-10-01T09:30:00Z"); // 15:00 IST
-    const r = ok(await svc.service.runSafetyCheck(id, { completedSessions: 2, ...exitQuotes() }));
+    const r = ok(await svc.service.runSafetyCheck(id, { completedSessions: 2, ...atEntryTime(exitQuotes(), svc.clock.peek()) }));
     expect(r.decision.action).toBe("AUTO_CLOSE");
     expect(r.trade.state).toBe("PAPER_AUTO_CLOSED");
     expect(r.trade.exit).toMatchObject({ trigger: "HOLDING_LIMIT", basis: "CURRENT_QUOTE", exitPremium: 120.05 });
@@ -487,7 +489,7 @@ describe("one lifecycle for LONG VOL and Best Opportunities", () => {
     const svc = makeService();
     const raw = longVolRaw({ source: "BEST_OPPORTUNITY", structure: "SINGLE_CALL", legs: [{ optionType: "CE", strike: 22900, quote: { bid: 69, ask: 69.8, volume: 6000, oi: 12000, bidQty: 6500, askQty: 6500 } }] });
     const id = await opened(svc, raw);
-    const t = ok(await svc.service.exit(id, { quotes: [{ instrument: CE_ID, bid: 66.05 }] }));
+    const t = ok(await svc.service.exit(id, { quotes: [{ instrument: CE_ID, bid: 66.05, ask: 66.55, asOf: svc.clock.peek() }] }));
     expect(t.source).toBe("BEST_OPPORTUNITY");
     expect(t.entry?.combinedEntryPremium).toBe(69.8);
     expect(t.realizedPnl?.grossPnl).toBe(-243.75);
@@ -543,7 +545,7 @@ describe("listing, risk filter and export", () => {
   it("exports the whole journal as plain JSON with counts and a durability notice", async () => {
     const svc = makeService();
     const id = await opened(svc);
-    ok(await svc.service.exit(id, exitQuotes()));
+    ok(await svc.service.exit(id, atEntryTime(exitQuotes(), svc.clock.peek())));
     const exp = await svc.service.exportJournal();
     expect(exp).toMatchObject({ exportVersion: 1, app: "nse-smart-trader-v2", counts: { trades: 1, events: 3 } });
     expect(exp.durabilityNotice).toMatch(/NOT guaranteed durable/);

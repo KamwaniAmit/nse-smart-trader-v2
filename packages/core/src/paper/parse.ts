@@ -227,8 +227,8 @@ function parseLegQuotes(raw: unknown, key: string, errs: string[], required: boo
     const volume = num(q, "volume", sub, { min: 0 });
     const oi = num(q, "oi", sub, { min: 0 });
     for (const e of sub) errs.push(`${where}.${e}`);
-    // Phase 1B.1 (D1): a confirmation quote keeps its OWN observation time. It is untrusted and is checked against the
-    // server clock by the service (so a bad time is reported as QUOTE_NOT_FRESH, not silently dropped).
+    // Phase 1B.1 (D1) / 1B.2 (A2): a quote keeps its OWN user-entry time. It is untrusted and is checked against the
+    // server clock by the service (so a bad time is reported, never silently dropped).
     const asOfRaw = q["asOf"];
     const asOf = withAsOf && asOfRaw !== undefined && asOfRaw !== null ? String(asOfRaw) : undefined;
     if (instrument !== null) out.push({ instrument, bid, ask, ltp, bidQty, askQty, volume, oi, ...(asOf !== undefined ? { asOf } : {}) });
@@ -260,7 +260,8 @@ export function parseConfirmRequest(raw: unknown): ParseResult<ConfirmRequestDTO
 export function parseMonitorRequest(raw: unknown): ParseResult<MonitorRequestDTO> {
   if (!isObj(raw)) return { ok: false, errors: ["Request body must be a JSON object"] };
   const errs: string[] = [];
-  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, true);
+  // Phase 1B.2 (A2): each price keeps its own manual-entry time; the service checks it against the server clock.
+  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, true, true);
   const asOf = optionalTimestamp(raw, "asOf", errs);
   const tradingDaysToExpiry = num(raw, "tradingDaysToExpiry", errs, { min: 0, integer: true });
   const spot = num(raw, "spot", errs, { positive: true });
@@ -272,7 +273,8 @@ export function parseMonitorRequest(raw: unknown): ParseResult<MonitorRequestDTO
 export function parseExitRequest(raw: unknown): ParseResult<ExitRequestDTO> {
   if (!isObj(raw)) return { ok: false, errors: ["Request body must be a JSON object"] };
   const errs: string[] = [];
-  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, true);
+  // Phase 1B.2 (A2): each price keeps its own manual-entry time; the service checks it against the server clock.
+  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, true, true);
   const asOf = optionalTimestamp(raw, "asOf", errs);
   const exitCosts = num(raw, "exitCosts", errs, { min: 0 });
   if (errs.length > 0) return { ok: false, errors: errs };
@@ -285,7 +287,7 @@ export function parseSafetyCheckRequest(raw: unknown): ParseResult<SafetyCheckRe
   // Phase 1B.1 (D3): asOf is optional and untrusted. Expiry and safety are decided on SERVER time.
   const asOf = optionalTimestamp(raw, "asOf", errs);
   const completedSessions = num(raw, "completedSessions", errs, { min: 0, integer: true });
-  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, false);
+  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, false, true); // Phase 1B.2 (A2): keep entry times
   const exitCosts = num(raw, "exitCosts", errs, { min: 0 });
   if (errs.length > 0) return { ok: false, errors: errs };
   return { ok: true, value: { ...(asOf ? { asOf } : {}), completedSessions, quotes, exitCosts } };

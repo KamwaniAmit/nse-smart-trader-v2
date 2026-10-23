@@ -46,6 +46,15 @@ export const exitQuotes = (ceBid: number | null = 66.05, peBid: number | null = 
   ...extra,
 });
 
+/**
+ * Phase 1B.2 (A2): monitor, exit and holding-limit prices carry their own MANUAL-ENTRY time. This stamps every quote in a
+ * request body with the time passed IN BY THE TEST (normally `svc.clock.peek()`, the time the service will read next, so
+ * the age is 0). There is no hidden or shared clock: the caller always says which time it means.
+ */
+export function atEntryTime<T extends { quotes: Array<Record<string, unknown>> }>(body: T, enteredAt: string): T {
+  return { ...body, quotes: body.quotes.map((q) => ({ ...q, asOf: enteredAt })) };
+}
+
 /** The fixture clock starts here. Each call to the service clock returns the current time and then moves it 1s on. */
 export const T0 = "2026-09-28T10:00:00Z";
 const iso = (ms: number): string => new Date(ms).toISOString().replace(".000Z", "Z");

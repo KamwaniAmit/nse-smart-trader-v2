@@ -135,6 +135,9 @@ describe("paper trading, risk and journal stay broker-independent and pure", () 
     expect(pricing).not.toMatch(/\.ltp\b|\bltp\s*[:=]/);
     const risk = stripComments(read(join(ROOT, "packages/core/src/paper/riskInputs.ts")));
     expect(risk).not.toMatch(/\.ltp\b/);
+    // Phase 1B.2: the shared bid/ask/entry-time validation used for entry, monitor, exit and holding-limit prices.
+    const validation = stripComments(read(join(ROOT, "packages/core/src/paper/quoteValidation.ts")));
+    expect(validation).not.toMatch(/\.ltp\b|\bltp\s*[:=]/);
   });
 });
 
