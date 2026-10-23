@@ -12,17 +12,17 @@
 | `npm ci` | 0 | lockfile unchanged |
 | `npm run typecheck` | 0 | all workspaces and `tests/` |
 | `npm run lint` | 0 | ESLint clean |
-| `npm run test` | 0 | **543 / 543** passed, 23 / 23 files |
+| `npm run test` | 0 | **573 / 573** passed, 23 / 23 files |
 | `npm run build` | 0 | core, adapters, api, web |
-| `npm run check` | 0 | 543 / 543 |
+| `npm run check` | 0 | 573 / 573 |
 
 | | Phase 1A (`5fda879`) | Phase 1B (`1d21f06`) | Phase 1B.1 |
 |---|---|---|---|
-| Tests | 98 | 474 | **543** |
+| Tests | 98 | 474 | **573** |
 
 - All 98 Phase 1A tests still run and pass; no Phase 1A test file was changed. (One Phase 1A test title was already renamed by Phase 1B with an identical assertion.)
-- Of the 474 Phase 1B tests, 471 are unchanged in name. **3 were rewritten** because they asserted the defective behaviour (listed below). 69 tests are new.
-- The 60 tests in `packages/core/tests/phase1b1Fixes.test.ts` were written first: **45 of them failed on `1d21f06`**, reproducing each defect; the other 15 pin boundaries that must keep passing.
+- Of the 474 Phase 1B tests, 471 are unchanged in name. **3 were rewritten** because they asserted the defective behaviour (listed below); each replaces its original one for one. **99 tests are new**: 69 for D1 to D5 (`817a5d4`), 2 journal export-URL tests (`6637e77`), 19 for R1 to R3 and 9 for R4 (see "Review corrections"). So 573 = 471 unchanged + 3 rewritten + 99 new. The increase over Phase 1B (474 to 573, +99) equals the number of new tests only because the 3 rewrites leave the count unchanged; 102 test names do not exist in Phase 1B (99 new + 3 rewritten).
+- The 60 D1 to D5 tests in `packages/core/tests/phase1b1Fixes.test.ts` were written first: **45 of them failed on `1d21f06`**, reproducing each defect; the other 15 pin boundaries that must keep passing. The file now holds **79** tests: those 60 plus 19 added by the review corrections (R2: 6, R3: 8, R4: 5).
 
 ## Defects, corrections and evidence
 
@@ -63,6 +63,7 @@
 - `packages/core/tests/fixtures.ts`: the service clock is injectable (`clock.peek / set / advance`, same tick as before); `confirmBody()` / `freshQuotes()` supply fresh quotes for the exact legs. `opened()` uses them.
 - Existing tests that confirmed with `{ confirmed: true }` now send `confirmBody(...)`; safety tests move the server clock instead of passing a client date. Expected numbers are unchanged; the snapshot test now also checks `snapshotVersion: 2`, `quoteAsOf` and `quoteAgeMs`.
 - `apps/api/tests/paperApi.test.ts` injects a monotonic test clock; `fileJournalRepository.test.ts` sends fresh quotes.
+- `apps/web/tests/phase1b.test.tsx` (`6637e77`): the existing journal export-link assertion now expects the configured API base (`VITE_API_BASE_URL`, empty = same origin) instead of assuming the relative URL, so it no longer depends on a local `apps/web/.env`; 2 new tests pin both configurations (absolute base and empty base).
 
 ## Unchanged (verified by diff)
 
