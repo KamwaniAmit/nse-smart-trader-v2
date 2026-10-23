@@ -378,3 +378,166 @@ describe("fixture sanity", () => {
     expect(ok(await svc.service.confirm(id, body)).state).toBe("PAPER_OPEN");
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Phase 1B.1 review corrections (R2, R3). Written BEFORE the corrections; see docs/PHASE_REPORTS/PHASE_1B1.md.
+// R1 (manual quote timestamps in the web form) is covered in apps/web/tests/phase1b.test.tsx.
+
+describe("R2: authoritative lifecycle and journal times are SERVER time; a tolerated client asOf is metadata only", () => {
+  const SKEW_OK = TIME_RULES.maxFutureSkewMs - 1000; // ahead of the server clock, but within the allowed skew
+
+  it("monitor with a slightly-future client asOf: updatedAt, the journal event and the snapshot use server time", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    const serverAt = svc.clock.peek();
+    const clientAt = shift(serverAt, SKEW_OK);
+    const t = ok(await svc.service.monitor(id, { ...exitQuotes(), asOf: clientAt }));
+    expect(t.updatedAt).toBe(serverAt);
+    expect(t.lastMonitor?.asOf).toBe(serverAt);
+    expect(t.lastMonitor?.clientAsOf).toBe(clientAt);
+    expect(t.lastValidExit?.asOf).toBe(serverAt);
+    const ev = (await svc.service.listEvents({ tradeId: id })).at(-1);
+    expect(ev).toMatchObject({ type: "MONITOR_SNAPSHOT", timestamp: serverAt, payload: { clientAsOf: clientAt } });
+  });
+
+  it("exit with a slightly-future client asOf: updatedAt, the exit record and the journal event use server time", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    const serverAt = svc.clock.peek();
+    const clientAt = shift(serverAt, SKEW_OK);
+    const t = ok(await svc.service.exit(id, { ...exitQuotes(), asOf: clientAt }));
+    expect(t.state).toBe("PAPER_EXITED");
+    expect(t.updatedAt).toBe(serverAt);
+    // R4: server processing time is the event time only; no quote-observation time exists, so priceAsOf is null.
+    expect(t.exit).toMatchObject({ timestamp: serverAt, priceAsOf: null, clientAsOf: clientAt });
+    const ev = (await svc.service.listEvents({ tradeId: id })).at(-1);
+    expect(ev).toMatchObject({ type: "TRADE_EXITED", timestamp: serverAt, payload: { clientAsOf: clientAt } });
+  });
+
+  it("a REJECTED exit (missing bid) is journaled at server time, with the client asOf only as metadata", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    const serverAt = svc.clock.peek();
+    const clientAt = shift(serverAt, SKEW_OK);
+    expect(err(await svc.service.exit(id, { ...exitQuotes(66.05, null), asOf: clientAt })).code).toBe("DATA_INSUFFICIENT");
+    const ev = (await svc.service.listEvents({ tradeId: id })).at(-1);
+    expect(ev).toMatchObject({ type: "EXIT_REJECTED_DATA_INSUFFICIENT", timestamp: serverAt, payload: { clientAsOf: clientAt } });
+  });
+
+  it("after a tolerated future client asOf, a normal event at the current server time is NOT rejected", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    ok(await svc.service.monitor(id, { ...exitQuotes(), asOf: shift(svc.clock.peek(), SKEW_OK) }));
+    // A client stamping the current server time (earlier than its previous, tolerated future stamp) is accepted.
+    ok(await svc.service.monitor(id, { ...exitQuotes(), asOf: svc.clock.peek() }));
+    // And a request with no client time at all is accepted.
+    ok(await svc.service.monitor(id, exitQuotes()));
+    expect(ok(await svc.service.exit(id, { ...exitQuotes(), asOf: svc.clock.peek() })).state).toBe("PAPER_EXITED");
+  });
+
+  it("client times are still validated: before the last update, beyond the skew, or malformed are rejected", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    expect(err(await svc.service.monitor(id, { ...exitQuotes(), asOf: shift(svc.clock.peek(), -60 * 60_000) })).code).toBe("INVALID_REQUEST");
+    expect(err(await svc.service.exit(id, { ...exitQuotes(), asOf: shift(svc.clock.peek(), TIME_RULES.maxFutureSkewMs + 60_000) })).code).toBe("INVALID_REQUEST");
+    expect(err(await svc.service.exit(id, { ...exitQuotes(), asOf: "2026-09-28" })).code).toBe("INVALID_REQUEST");
+    expect(ok(await svc.service.getTrade(id)).trade.state).toBe("PAPER_OPEN");
+  });
+
+  it("expiry is still decided on server time, not on a valid client asOf", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    svc.clock.set("2026-10-07T03:50:00Z");
+    const r = ok(await svc.service.runSafetyCheck(id, { asOf: svc.clock.peek() }));
+    expect(r.trade.state).toBe("PAPER_EXPIRED");
+    expect(r.trade.updatedAt).toBe("2026-10-07T03:50:00Z");
+  });
+});
+
+describe("R3: conflicting duplicate entry quotes are ambiguous, whichever field conflicts", () => {
+  const confirmWith = async (extra: Record<string, unknown>) => {
+    const svc = makeService();
+    const id = await reviewed(svc);
+    const now = svc.clock.peek();
+    const base = freshQuotes(longVolRaw(), now);
+    const quotes = [...base, { ...base[0], ...extra }];
+    return { svc, id, r: await svc.service.confirm(id, { confirmed: true, quotes }) };
+  };
+
+  it.each([
+    ["bid quantity", { bidQty: 100 }],
+    ["ask quantity", { askQty: 100 }],
+    ["volume", { volume: 1 }],
+    ["open interest", { oi: 1 }],
+    ["LTP", { ltp: 70.1 }],
+    ["a field present in one copy only (volume missing)", { volume: null }],
+  ])("a duplicate CE quote that differs only in %s is refused (DATA_INSUFFICIENT); the trade stays in review", async (_n, extra) => {
+    const { svc, id, r } = await confirmWith(extra);
+    const e = err(r);
+    expect(e.code).toBe("DATA_INSUFFICIENT");
+    expect(e.details?.join(" ")).toMatch(/CE 22900: conflicting quotes supplied/);
+    expect(ok(await svc.service.getTrade(id)).trade.state).toBe("PAPER_REVIEW");
+  });
+
+  it("an IDENTICAL duplicate is still accepted (unchanged contract)", async () => {
+    const { r } = await confirmWith({});
+    expect(ok(r).state).toBe("PAPER_OPEN");
+  });
+
+  it("a quote for another instrument is still an INVALID_REQUEST (exact-instrument rule unchanged)", async () => {
+    const svc = makeService();
+    const id = await reviewed(svc);
+    const now = svc.clock.peek();
+    const quotes = [...freshQuotes(longVolRaw(), now), { instrument: { provider: "manual", id: "NIFTY|2026-10-06|CE|23000" }, bid: 1, ask: 2, asOf: now }];
+    expect(err(await svc.service.confirm(id, { confirmed: true, quotes })).code).toBe("INVALID_REQUEST");
+  });
+});
+
+describe("R4: server processing time is never presented as a quote-observation time", () => {
+  it("a user exit at valid bids: event time = server time, priceAsOf = null (unavailable); P&L and state unchanged", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    const serverAt = svc.clock.peek();
+    const t = ok(await svc.service.exit(id, exitQuotes()));
+    expect(t.state).toBe("PAPER_EXITED");
+    expect(t.exit).toMatchObject({ trigger: "USER_EXIT", basis: "CURRENT_QUOTE", timestamp: serverAt, priceAsOf: null, exitPremium: 120.05, valuationStatus: "EXECUTABLE_QUOTE" });
+    expect(t.realizedPnl).toMatchObject({ status: "VALID", grossPnl: -45.5 });
+  });
+
+  it("a validated client asOf is NOT promoted to a quote-observation time (it stays clientAsOf metadata)", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    const clientAt = shift(svc.clock.peek(), 1000);
+    const t = ok(await svc.service.exit(id, { ...exitQuotes(), asOf: clientAt }));
+    expect(t.exit?.priceAsOf).toBeNull();
+    expect(t.exit?.clientAsOf).toBe(clientAt);
+  });
+
+  it.each([
+    ["holding-limit closure", "2026-10-01T09:30:00Z", { completedSessions: 2 }, "PAPER_AUTO_CLOSED"],
+    ["expiry closure", "2026-10-07T03:50:00Z", {}, "PAPER_EXPIRED"],
+  ] as const)("%s at current valid bids: priceAsOf = null, event time = server time, P&L VALID (unchanged)", async (_n, at, extra, state) => {
+    const svc = makeService();
+    const id = await opened(svc);
+    svc.clock.set(at);
+    const r = ok(await svc.service.runSafetyCheck(id, { ...extra, ...exitQuotes() }));
+    expect(r.trade.state).toBe(state);
+    expect(r.trade.exit).toMatchObject({ basis: "CURRENT_QUOTE", timestamp: at, priceAsOf: null, exitPremium: 120.05 });
+    expect(r.trade.realizedPnl).toMatchObject({ status: "VALID", grossPnl: -45.5 });
+  });
+
+  it("the last valid monitored bids carry the SERVER time the monitor update was recorded, and the closure note says so", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    const recordedAt = svc.clock.peek();
+    const m = ok(await svc.service.monitor(id, exitQuotes()));
+    expect(m.lastValidExit?.asOf).toBe(recordedAt);
+    expect(m.lastMonitor?.asOf).toBe(recordedAt);
+    svc.clock.set("2026-10-07T03:50:00Z");
+    const r = ok(await svc.service.runSafetyCheck(id, {}));
+    expect(r.trade.exit?.staleReference?.asOf).toBe(recordedAt);
+    const notes = r.trade.exit?.notes.join(" ") ?? "";
+    expect(notes).toContain(`recorded by the server at ${recordedAt}`);
+    expect(notes).not.toMatch(/as of /);
+  });
+});

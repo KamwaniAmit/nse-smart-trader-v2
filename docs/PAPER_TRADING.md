@@ -64,11 +64,14 @@ one lot of 65 → gross **−45.50**.
 A trade opens only with `confirmed: true` **and** a fresh executable quote for **every** leg, sent with the confirmation:
 `{ "confirmed": true, "quotes": [{ "instrument": {...}, "bid": …, "ask": …, "asOf": "2026-09-28T10:00:05+05:30", … }, …] }`.
 
-- Each quote must be for the **exact** stored instrument. A quote for another strike, expiry or instrument is refused (`INVALID_REQUEST`), never substituted.
+- Each quote must be for the **exact** stored instrument. Duplicate quotes for one leg are accepted only if **every** field is identical
+  (bid, ask, LTP, bid/ask quantity, volume, open interest and time); any difference is ambiguous and refused (`DATA_INSUFFICIENT`). A quote for another strike, expiry or instrument is refused (`INVALID_REQUEST`), never substituted.
 - Each quote needs a valid **bid and ask** (ask ≥ bid). LTP, theoretical, model and review-time prices are never used (`DATA_INSUFFICIENT`).
 - Each quote needs its own time (`asOf`): a full timestamp **with a zone**. It is checked against the **server clock**: it may be at most
   **60 seconds old** (approved policy) and at most the allowed clock skew in the future. A missing, invalid, ambiguous, stale or future time is refused
-  (`QUOTE_NOT_FRESH`). For manually typed prices, the web app stamps each leg with the moment its prices were typed.
+  (`QUOTE_NOT_FRESH`). For manually typed prices the web app records a **user-entry time per price** (bid and ask separately; editing
+  volume, open interest or depth never changes it) and sends the **older** of the leg's two price times. If either price has no entry time,
+  no time is sent and the quote is refused. These are user-entry times, not exchange timestamps; they do not prove the prices were current.
 - A refused confirmation is journaled (`CONFIRM_REJECTED_QUOTE`) and the trade **stays in `PAPER_REVIEW`**, so it can be confirmed again with fresh prices.
 - Entry premium, capital (and the capital gate) and entry risk are **recalculated** from the fresh quotes. The review record keeps the review-time numbers as history.
 - Spot, trading days to expiry, expected and implied move, expected net edge and score are the candidate's values (supplied at review). They are not
@@ -100,7 +103,14 @@ risk. Valid bids are remembered as the *last valid exit*. An invalid update (a m
 - The **server clock** is the only trusted time. It is injected into the service (`now`), so tests are deterministic.
 - Client times (`asOf` on monitor, exit and safety check) are **untrusted**. When supplied they must be a full timestamp with a zone, must not be
   earlier than the trade's last recorded update (at least the entry snapshot), and must not be later than server time plus the allowed skew. Otherwise the
-  request is refused (`INVALID_REQUEST`) and nothing changes. When omitted, server time is used.
+  request is refused (`INVALID_REQUEST`) and nothing changes.
+- A client time that passes validation is **metadata only** (`clientAsOf` on the monitor snapshot, the exit record and the journal event payload).
+  `updatedAt`, journal event timestamps, the monitor time and the exit time are **always server time**, including for a refused exit.
+- **Server processing time is not a quote-observation time (review correction R4).** Monitor, exit and safety quotes carry no observation time
+  of their own. So `exit.timestamp`, `lastMonitor.asOf` and `lastValidExit.asOf` (and `staleReference.asOf`) mean "when the server recorded it",
+  and `exit.priceAsOf` (the quote-observation time) is **null: not available**. It is never filled with server or client time. Records written before
+  R4 may hold a time in `priceAsOf`; the UI labels it as not a verified quote-observation time. The only per-quote times that exist are the
+  user-entry times on entry quotes (`entry.legs[].quoteAsOf`), which are not exchange timestamps either.
 - Allowed clock skew: **5 seconds** (`TIME_RULES.maxFutureSkewMs`). This is a DEFAULT engineering value with no source in the specification; it awaits owner review.
 - Quote freshness at confirmation: **60 seconds** (`TIME_RULES.maxQuoteAgeMs`, approved).
 

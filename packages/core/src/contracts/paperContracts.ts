@@ -249,9 +249,15 @@ export type ExitValuationStatus = "EXECUTABLE_QUOTE" | "DATA_INSUFFICIENT";
 export type ExitTrigger = "USER_EXIT" | "EXPIRY" | "HOLDING_LIMIT";
 
 export interface PaperExitRecord {
+  /** Server processing time of the exit / closure event (authoritative). Not a quote-observation time. */
   timestamp: string;
   trigger: ExitTrigger;
   basis: ExitBasis;
+  /**
+   * When the exit quote was OBSERVED, if a trustworthy observation time exists. Review correction R4: monitor, exit and
+   * safety quotes carry no observation time, so new records store null ("unavailable"); the server processing time is in
+   * `timestamp`. Records written before R4 may hold a server or client time here; it is not a verified observation time.
+   */
   priceAsOf: string | null;
   legBids: Array<{ instrument: InstrumentRefDTO; bid: number | null }>;
   exitPremium: number | null;
@@ -261,9 +267,12 @@ export interface PaperExitRecord {
   valuationStatus?: ExitValuationStatus;
   /** Phase 1B.1 (D2): the last valid monitored bids, kept for HISTORICAL REFERENCE ONLY. Never used for P&L. */
   staleReference?: LastValidExit | null;
+  /** Review correction R2: the validated client-supplied asOf, as metadata only. `timestamp` is always server time. */
+  clientAsOf?: string;
 }
 
 export interface PaperMonitorSnapshot {
+  /** Server time this monitor update was recorded (processing time). Not a quote-observation time (R4). */
   asOf: string;
   legs: Array<{ instrument: InstrumentRefDTO; bid: number | null; ask: number | null; bidValid: boolean }>;
   dataStatus: "VALID" | "DATA_INSUFFICIENT";
@@ -272,9 +281,12 @@ export interface PaperMonitorSnapshot {
   unrealized: PaperPnl;
   currentRisk: RiskAssessmentRecord;
   carriedFromEntry: string[];
+  /** Review correction R2: the validated client-supplied asOf, as metadata only. `asOf` is always server time. */
+  clientAsOf?: string;
 }
 
 export interface LastValidExit {
+  /** Server time the monitor update holding these bids was recorded (processing time). Not a quote-observation time (R4). */
   asOf: string;
   legBids: Array<{ instrument: InstrumentRefDTO; bid: number }>;
   exitPremium: number;

@@ -86,7 +86,7 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
       {entry ? (
         <table>
           <thead>
-            <tr><th>Leg</th><th>Strike</th><th>Ask (entry)</th><th>Bid at entry</th><th>Quote time</th></tr>
+            <tr><th>Leg</th><th>Strike</th><th>Ask (entry)</th><th>Bid at entry</th><th>Quote entry time (user-entered)</th></tr>
           </thead>
           <tbody>
             {entry.legs.map((l) => (
@@ -131,7 +131,7 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
         trade.lastMonitor ? (
           <>
             <PnlLine label="Unrealized P&L" pnl={trade.lastMonitor.unrealized} />
-            <p className="hint">As of {trade.lastMonitor.asOf}. Exit premium now {inr(trade.lastMonitor.currentExitPremium)} (sum of bids). {trade.lastMonitor.dataReasons.join("; ")}</p>
+            <p className="hint">Recorded by the server at {trade.lastMonitor.asOf} (processing time; these quotes carry no observation time). Exit premium now {inr(trade.lastMonitor.currentExitPremium)} (sum of bids). {trade.lastMonitor.dataReasons.join("; ")}</p>
           </>
         ) : (
           <p>Not monitored yet: no executable bids have been recorded.</p>
@@ -144,12 +144,16 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
             <p className="hint">
               {trade.exit.trigger} · price basis {trade.exit.basis}
               {trade.exit.valuationStatus ? ` · valuation ${trade.exit.valuationStatus}` : ""}
-              {trade.exit.priceAsOf ? ` (as of ${trade.exit.priceAsOf})` : ""} · exit premium {inr(trade.exit.exitPremium)} {trade.exit.notes.join(" ")}
+              {` · processed by the server at ${trade.exit.timestamp}`}
+              {trade.exit.priceAsOf
+                ? ` · price time ${trade.exit.priceAsOf} recorded by an earlier version; not a verified quote-observation time`
+                : " · quote observation time: not available"}
+              {" · exit premium "}{inr(trade.exit.exitPremium)} {trade.exit.notes.join(" ")}
             </p>
           ) : null}
           {trade.exit?.staleReference ? (
             <p className="hint" data-stale-reference="true">
-              Reference only (not an exit price, not used for P&amp;L): last valid monitored bids as of {trade.exit.staleReference.asOf}, exit premium {inr(trade.exit.staleReference.exitPremium)}.
+              Reference only (not an exit price, not used for P&amp;L): last valid monitored bids recorded by the server at {trade.exit.staleReference.asOf}, exit premium {inr(trade.exit.staleReference.exitPremium)}.
             </p>
           ) : null}
         </>

@@ -91,6 +91,10 @@ function missingMarketData(candidate: PaperCandidate): string[] {
 
 const sameInstrument = (a: { provider: string; id: string }, b: { provider: string; id: string }): boolean => a.provider === b.provider && a.id === b.id;
 
+/** Every field of an entry quote that affects the accepted quote or the entry snapshot. Absent and null are the same. */
+const entryQuoteKey = (q: EntryQuoteDTO): string =>
+  JSON.stringify([q.bid ?? null, q.ask ?? null, q.ltp ?? null, q.bidQty ?? null, q.askQty ?? null, q.volume ?? null, q.oi ?? null, q.asOf ?? null]);
+
 interface FreshLeg extends PaperLeg {
   quoteAsOf: string;
   quoteAgeMs: number;
@@ -124,7 +128,9 @@ export function resolveFreshEntryQuotes(legs: readonly PaperLeg[], quotes: reado
       priceReasons.push(`${label}: no fresh quote supplied for this exact instrument`);
       continue;
     }
-    if (new Set(matches.map((m) => JSON.stringify([m.bid, m.ask ?? null, m.asOf ?? null]))).size > 1) {
+    // Review correction R3: duplicates must agree on EVERY field that feeds the accepted quote and the entry snapshot
+    // (prices, LTP, depth, volume, OI and time). Any disagreement is ambiguous; the first copy is never picked.
+    if (new Set(matches.map(entryQuoteKey)).size > 1) {
       priceReasons.push(`${label}: conflicting quotes supplied; ambiguous, so not used`);
       continue;
     }
@@ -333,7 +339,10 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
         const serverNow = now();
         const late = req.asOf === undefined ? [] : checkEventTime(req.asOf, { nowMs: Date.parse(serverNow), ...notBefore(trade) });
         if (late.length > 0) return fail("INVALID_REQUEST", "The monitor time (asOf) is not acceptable.", late, trade);
-        const asOf = req.asOf ?? serverNow;
+        // Review correction R2: the authoritative time is the SERVER clock. A validated client asOf is kept only as
+        // observational metadata (clientAsOf); it never becomes updatedAt or a journal event time.
+        const asOf = serverNow;
+        const clientAsOf = req.asOf;
         const bidsResult = resolveLegBids(trade.candidate.legs, req.quotes);
         const exitPremium = exitPremiumOf(bidsResult.bids);
         const valid = exitPremium !== null;
@@ -373,6 +382,7 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
           unrealized,
           currentRisk,
           carriedFromEntry,
+          ...(clientAsOf !== undefined ? { clientAsOf } : {}),
         };
         const lastValidExit: LastValidExit | undefined = valid
           ? { asOf, legBids: trade.candidate.legs.map((l, i) => ({ instrument: l.instrument, bid: bidsResult.bids[i] as number })), exitPremium }
@@ -380,7 +390,7 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
         const updated = await repository.updateLifecycle(
           tradeId,
           { updatedAt: asOf, lastMonitor: snapshot, currentRisk, ...(lastValidExit ? { lastValidExit } : {}) },
-          { timestamp: asOf, type: "MONITOR_SNAPSHOT", tradeId, fromState: "PAPER_OPEN", toState: "PAPER_OPEN", payload: { dataStatus: snapshot.dataStatus, currentExitPremium: exitPremium, grossPnl: unrealized.grossPnl, riskLevel: currentRisk.result.riskLevel } },
+          { timestamp: asOf, type: "MONITOR_SNAPSHOT", tradeId, fromState: "PAPER_OPEN", toState: "PAPER_OPEN", payload: { dataStatus: snapshot.dataStatus, currentExitPremium: exitPremium, grossPnl: unrealized.grossPnl, riskLevel: currentRisk.result.riskLevel, ...(clientAsOf !== undefined ? { clientAsOf } : {}) } },
         );
         return good(updated);
       });
@@ -401,11 +411,13 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
         const serverNow = now();
         const late = req.asOf === undefined ? [] : checkEventTime(req.asOf, { nowMs: Date.parse(serverNow), ...notBefore(trade) });
         if (late.length > 0) return fail("INVALID_REQUEST", "The exit time (asOf) is not acceptable.", late, trade);
-        const at = req.asOf ?? serverNow;
+        // Review correction R2: server time is authoritative for the exit, its journal event and a rejected attempt.
+        const at = serverNow;
+        const clientAsOf = req.asOf;
         const bidsResult = resolveLegBids(trade.candidate.legs, req.quotes);
         const exitPremium = exitPremiumOf(bidsResult.bids);
         if (exitPremium === null) {
-          await repository.appendEvent({ timestamp: at, type: "EXIT_REJECTED_DATA_INSUFFICIENT", tradeId, fromState: "PAPER_OPEN", toState: "PAPER_OPEN", payload: { reasons: bidsResult.reasons } });
+          await repository.appendEvent({ timestamp: at, type: "EXIT_REJECTED_DATA_INSUFFICIENT", tradeId, fromState: "PAPER_OPEN", toState: "PAPER_OPEN", payload: { reasons: bidsResult.reasons, ...(clientAsOf !== undefined ? { clientAsOf } : {}) } });
           const unchanged = await repository.getTrade(tradeId);
           return fail("DATA_INSUFFICIENT", "No valid executable bid for every leg. The trade stays PAPER_OPEN; no exit price is invented.", bidsResult.reasons, unchanged ?? trade);
         }
@@ -413,19 +425,21 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
           timestamp: at,
           trigger: "USER_EXIT",
           basis: "CURRENT_QUOTE",
-          priceAsOf: at,
+          // R4: these quotes carry no observation time, so none is recorded. `timestamp` is the server processing time.
+          priceAsOf: null,
           legBids: trade.candidate.legs.map((l, i) => ({ instrument: l.instrument, bid: bidsResult.bids[i] ?? null })),
           exitPremium,
           exitCosts: req.exitCosts ?? null,
           notes: [],
           valuationStatus: "EXECUTABLE_QUOTE",
           staleReference: null,
+          ...(clientAsOf !== undefined ? { clientAsOf } : {}),
         };
         const realizedPnl = computePnl({ entryPremium: entry.combinedEntryPremium, exitPremium, lotSize: entry.lotSize, lots: entry.lots, entryCosts: entry.capital.entryCosts, exitCosts: req.exitCosts ?? null });
         const updated = await repository.updateLifecycle(
           tradeId,
           { updatedAt: at, state: "PAPER_EXITED", exit, realizedPnl },
-          { timestamp: at, type: "TRADE_EXITED", tradeId, fromState: "PAPER_OPEN", toState: "PAPER_EXITED", payload: { exitPremium, grossPnl: realizedPnl.grossPnl, netPnl: realizedPnl.netPnl } },
+          { timestamp: at, type: "TRADE_EXITED", tradeId, fromState: "PAPER_OPEN", toState: "PAPER_EXITED", payload: { exitPremium, grossPnl: realizedPnl.grossPnl, netPnl: realizedPnl.netPnl, ...(clientAsOf !== undefined ? { clientAsOf } : {}) } },
         );
         return good(updated);
       });
@@ -462,7 +476,7 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
         const trigger = decision.action === "EXPIRE" ? "EXPIRY" : "HOLDING_LIMIT";
         if (currentPremium !== null) {
           exit = {
-            timestamp: serverNow, trigger, basis: "CURRENT_QUOTE", priceAsOf: serverNow,
+            timestamp: serverNow, trigger, basis: "CURRENT_QUOTE", priceAsOf: null, // R4: no quote-observation time exists
             legBids: trade.candidate.legs.map((l, i) => ({ instrument: l.instrument, bid: current.bids[i] ?? null })),
             exitPremium: currentPremium, exitCosts: req.exitCosts ?? null, notes,
             valuationStatus: "EXECUTABLE_QUOTE", staleReference: null,
@@ -470,7 +484,7 @@ export function createPaperTradingService(deps: PaperTradingDeps) {
         } else {
           notes.push("No valid executable bid for every leg at closure, so there is no exit price and P&L is DATA_INSUFFICIENT.", ...current.reasons);
           if (trade.lastValidExit !== null) {
-            notes.push(`The last valid monitored bids (as of ${trade.lastValidExit.asOf}, exit premium ${trade.lastValidExit.exitPremium}) are kept as staleReference for historical reference only. They are not an executable exit price and are not used for P&L.`);
+            notes.push(`The last valid monitored bids (recorded by the server at ${trade.lastValidExit.asOf}, exit premium ${trade.lastValidExit.exitPremium}) are kept as staleReference for historical reference only. They are not an executable exit price and are not used for P&L.`);
           }
           exit = {
             timestamp: serverNow, trigger, basis: "NONE", priceAsOf: null,

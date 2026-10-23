@@ -208,6 +208,96 @@ describe("Paper Trading: review -> confirm", () => {
   });
 });
 
+// Phase 1B.1 review correction R1: manual entry times are tracked per PRICE (bid, ask). Editing depth, volume or open
+// interest never refreshes a price time, and re-typing one price never refreshes the other. The quote time sent is the
+// OLDER of the two price entry times, so a quote is never presented as newer than its stalest price.
+describe("R1: manual quote entry times (confirmation form)", () => {
+  const T1 = Date.parse("2026-10-23T05:00:00.000Z");
+  const at_ = (ms: number) => vi.setSystemTime(new Date(T1 + ms));
+  const iso = (ms: number) => new Date(T1 + ms).toISOString();
+  const label = (leg: string, field: string) => `Confirm paper trade: ${leg} ${field}`;
+
+  afterEach(() => vi.useRealTimers());
+
+  async function openReview() {
+    const t = makeTrade("PAPER_REVIEW");
+    const calls = stubApi({
+      "GET /api/paper/trades": () => ({ body: { trades: [t] } }),
+      [`GET /api/paper/trades/${t.tradeId}`]: () => ({ body: { trade: t, events: [] } }),
+      [`POST /api/paper/trades/${t.tradeId}/confirm`]: () => ({ body: makeTrade("PAPER_OPEN") }),
+    });
+    at("/paper-trading");
+    fireEvent.click(await screen.findByRole("button", { name: `Open ${t.tradeId}` }));
+    await screen.findByRole("button", { name: "Confirm paper trade" });
+    vi.useFakeTimers({ toFake: ["Date"] }); // only the clock is controlled; React and the test runner keep real timers
+    return calls;
+  }
+  async function submit(calls: Call[]) {
+    fireEvent.click(screen.getByLabelText("I confirm this paper trade"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm paper trade" }));
+    await waitFor(() => expect(posts(calls, "/confirm")).toHaveLength(1));
+    return (posts(calls, "/confirm")[0]?.body as { quotes: Array<{ bid: number | null; ask: number | null; asOf?: string }> }).quotes;
+  }
+
+  it("editing volume, open interest, bid quantity or ask quantity later does NOT refresh the price time", async () => {
+    const calls = await openReview();
+    at_(0); setField(label("CE 22900", "bid"), "70");
+    at_(1_000); setField(label("CE 22900", "ask"), "70.5");
+    at_(2_000); setField(label("PE 22800", "bid"), "50.6");
+    at_(3_000); setField(label("PE 22800", "ask"), "51.25");
+    at_(45_000);
+    for (const leg of ["CE 22900", "PE 22800"]) {
+      setField(label(leg, "volume"), "6000");
+      setField(label(leg, "open interest"), "12000");
+      setField(label(leg, "bid quantity"), "6500");
+      setField(label(leg, "ask quantity"), "6500");
+    }
+    const quotes = await submit(calls);
+    expect(quotes.map((q) => q.asOf)).toEqual([iso(0), iso(2_000)]); // the older price time of each leg, not 45 s
+  });
+
+  it("re-typing the ask later does NOT refresh the unchanged bid: the quote keeps the older (bid) time", async () => {
+    const calls = await openReview();
+    at_(0); setField(label("CE 22900", "bid"), "70");
+    at_(1_000); setField(label("CE 22900", "ask"), "70.5");
+    at_(0); setField(label("PE 22800", "bid"), "50.6");
+    at_(1_000); setField(label("PE 22800", "ask"), "51.25");
+    at_(50_000); setField(label("CE 22900", "ask"), "70.75"); // only the CE ask is re-entered
+    const quotes = await submit(calls);
+    expect(quotes[0]).toMatchObject({ bid: 70, ask: 70.75, asOf: iso(0) });
+    expect(quotes[1]).toMatchObject({ asOf: iso(0) });
+  });
+
+  it("a price that was never entered sends NO quote time (the server then refuses it); it is never treated as fresh", async () => {
+    const calls = await openReview();
+    at_(0); setField(label("CE 22900", "bid"), "70"); // CE ask never entered
+    setField(label("PE 22800", "bid"), "50.6");
+    setField(label("PE 22800", "ask"), "51.25");
+    const quotes = await submit(calls);
+    expect(quotes[0]).toMatchObject({ bid: 70, ask: null });
+    expect(quotes[0]).not.toHaveProperty("asOf");
+    expect(quotes[1]).toMatchObject({ asOf: iso(0) });
+  });
+
+  it("clearing a price removes its entry time, so the quote is sent without a time", async () => {
+    const calls = await openReview();
+    at_(0); setField(label("CE 22900", "bid"), "70");
+    setField(label("CE 22900", "ask"), "70.5");
+    at_(5_000); setField(label("CE 22900", "bid"), "");
+    const quotes = await submit(calls);
+    expect(quotes[0]).toMatchObject({ bid: null });
+    expect(quotes[0]).not.toHaveProperty("asOf");
+  });
+
+  it("labels the times as user-entry times, not exchange timestamps, and does not claim they prove freshness", async () => {
+    await openReview();
+    expect(screen.getByText(/user-entry times, not exchange timestamps/)).toBeInTheDocument();
+    expect(screen.getByText(/do not prove that the prices were current market prices/)).toBeInTheDocument();
+    at_(0); setField(label("CE 22900", "bid"), "70");
+    expect(screen.getByText(/CE 22900 bid entered at 2026-10-23T05:00:00.000Z/)).toBeInTheDocument();
+  });
+});
+
 describe("Paper Trading: open trade", () => {
   const open = makeTrade("PAPER_OPEN", { lastMonitor: { asOf: "2026-09-28T11:00:00Z", legs: [], dataStatus: "VALID", dataReasons: [], currentExitPremium: 120.05, unrealized: { status: "VALID", reason: null, grossPnl: -45.5, netPnl: null, netStatus: "COSTS_UNAVAILABLE" }, currentRisk: risk("HIGH"), carriedFromEntry: [] } });
   const setup = (trade: PaperTradeRecord = open, extra: Record<string, () => { status?: number; body: unknown }> = {}) => {
@@ -371,6 +461,63 @@ describe("Paper Trading: history, journal, export", () => {
 // The API base is read once, when apiClient is first imported. Each case therefore stubs the variable, resets the module
 // registry and imports a fresh copy, so the result does not depend on any local .env file. afterEach restores the
 // environment and the module registry even when an assertion fails.
+// Review correction R4: server processing time is never shown as a quote-observation time.
+describe("R4: the UI separates server processing time from quote-observation time", () => {
+  const show = async (trade: PaperTradeRecord) => {
+    stubApi({
+      "GET /api/paper/trades": () => ({ body: { trades: [trade] } }),
+      [`GET /api/paper/trades/${trade.tradeId}`]: () => ({ body: { trade, events: [] } }),
+    });
+    at("/paper-trading");
+    if (trade.state !== "PAPER_OPEN") fireEvent.click(await screen.findByRole("tab", { name: "History" }));
+    fireEvent.click(await screen.findByRole("button", { name: `Open ${trade.tradeId}` }));
+  };
+  const pnl = { status: "VALID" as const, reason: null, grossPnl: -45.5, netPnl: null, netStatus: "COSTS_UNAVAILABLE" as const };
+
+  it("an exit shows the server processing time and 'quote observation time: not available', never 'as of' the server time", async () => {
+    const T = "2026-10-01T09:30:00.000Z";
+    await show(makeTrade("PAPER_EXITED", {
+      tradeId: "pt_exit",
+      exit: { timestamp: T, trigger: "USER_EXIT", basis: "CURRENT_QUOTE", priceAsOf: null, legBids: [], exitPremium: 120.05, exitCosts: null, notes: [], valuationStatus: "EXECUTABLE_QUOTE", staleReference: null },
+      realizedPnl: pnl,
+    }));
+    expect(await screen.findByText(new RegExp(`processed by the server at ${T}`))).toBeInTheDocument();
+    expect(screen.getByText(/quote observation time: not available/)).toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(`as of ${T}`, "i"))).toBeNull();
+    expect(screen.getByText(/Realized P&L:/)).toBeInTheDocument();
+  });
+
+  it("an older record's non-null priceAsOf is labelled as NOT a verified quote-observation time", async () => {
+    await show(makeTrade("PAPER_EXITED", {
+      tradeId: "pt_legacy",
+      exit: { timestamp: "2026-10-01T09:30:00Z", trigger: "USER_EXIT", basis: "CURRENT_QUOTE", priceAsOf: "2026-10-01T09:30:00Z", legBids: [], exitPremium: 120.05, exitCosts: null, notes: [] },
+      realizedPnl: pnl,
+    }));
+    expect(await screen.findByText(/price time 2026-10-01T09:30:00Z recorded by an earlier version; not a verified quote-observation time/)).toBeInTheDocument();
+  });
+
+  it("monitoring shows when the SERVER recorded the update, not 'As of'", async () => {
+    const T = "2026-09-28T11:00:00Z";
+    await show(makeTrade("PAPER_OPEN", {
+      tradeId: "pt_mon",
+      lastMonitor: { asOf: T, legs: [], dataStatus: "VALID", dataReasons: [], currentExitPremium: 120.05, unrealized: pnl, currentRisk: risk("LOW"), carriedFromEntry: [] },
+    }));
+    expect(await screen.findByText(new RegExp(`Recorded by the server at ${T}`))).toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(`As of ${T}`))).toBeNull();
+  });
+
+  it("a stale reference is described by when the server recorded it, not 'as of'", async () => {
+    await show(makeTrade("PAPER_EXPIRED", {
+      tradeId: "pt_ref",
+      exit: { timestamp: "2026-10-07T03:50:00Z", trigger: "EXPIRY", basis: "NONE", priceAsOf: null, legBids: [], exitPremium: null, exitCosts: null, notes: [], valuationStatus: "DATA_INSUFFICIENT", staleReference: { asOf: "2026-09-29T04:30:00Z", legBids: [], exitPremium: 120.05 } },
+      realizedPnl: { status: "DATA_INSUFFICIENT", reason: "No valid executable exit price.", grossPnl: null, netPnl: null, netStatus: "DATA_INSUFFICIENT" },
+    }));
+    const ref = await screen.findByText(/Reference only \(not an exit price, not used for P&L\)/);
+    expect(ref).toHaveTextContent("recorded by the server at 2026-09-29T04:30:00Z");
+    expect(ref).not.toHaveTextContent(/as of/i);
+  });
+});
+
 describe("journal export URL follows the configured API base (exportUrl)", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
