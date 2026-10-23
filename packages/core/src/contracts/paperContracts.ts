@@ -85,8 +85,18 @@ export interface LegQuoteDTO {
   oi?: number | null;
 }
 
+/**
+ * Phase 1B.1 (D1): an entry quote also carries the time it was observed. The server checks that time against its own
+ * clock; it is never trusted on its own. For MANUAL data it is the time the user entered the prices.
+ */
+export interface EntryQuoteDTO extends LegQuoteDTO {
+  asOf?: string;
+}
+
 export interface ConfirmRequestDTO {
   confirmed: boolean;
+  /** Fresh executable quotes for EVERY leg (exact instruments). Required when confirmed is true (Phase 1B.1, D1). */
+  quotes?: EntryQuoteDTO[];
 }
 export interface MonitorRequestDTO {
   asOf?: string;
@@ -101,7 +111,8 @@ export interface ExitRequestDTO {
   exitCosts?: number | null;
 }
 export interface SafetyCheckRequestDTO {
-  asOf: string;
+  /** Optional and untrusted (Phase 1B.1, D3): validated and recorded, but expiry and safety are decided on SERVER time. */
+  asOf?: string;
   completedSessions?: number | null;
   quotes?: LegQuoteDTO[];
   exitCosts?: number | null;
@@ -193,11 +204,15 @@ export interface PaperEntryLeg {
   readonly instrument: InstrumentRefDTO;
   readonly entryAsk: number;
   readonly entryBid: number | null;
+  /** Phase 1B.1 (D1): when this leg's entry quote was observed, and how old it was at confirmation. Absent on v1 snapshots. */
+  readonly quoteAsOf?: string;
+  readonly quoteAgeMs?: number;
 }
 
 /** Recorded once, at confirmation. Frozen in memory and never changed afterwards. */
 export interface PaperEntrySnapshot {
-  readonly snapshotVersion: 1;
+  /** 1 = Phase 1B (priced from review-time quotes). 2 = Phase 1B.1 (priced from fresh, time-checked quotes). */
+  readonly snapshotVersion: 1 | 2;
   readonly capturedAt: string;
   readonly candidateId: string;
   readonly source: PaperSource;
@@ -218,9 +233,19 @@ export interface PaperEntrySnapshot {
   readonly capital: CapitalAssessment;
   readonly capitalRequirement: number | null;
   readonly dataCompleteness: { readonly complete: boolean; readonly missing: readonly string[] };
+  /** Phase 1B.1 (D1): the freshness rule applied at confirmation. Absent on v1 snapshots. */
+  readonly quoteFreshness?: { readonly maxQuoteAgeMs: number; readonly maxFutureSkewMs: number; readonly evaluatedAt: string };
+  /** Phase 1B.1 (D1): when the candidate (spot, moves, edge, score) was supplied. These are NOT re-priced at confirmation. */
+  readonly candidateAsOf?: string;
 }
 
+/**
+ * "LAST_VALID_MONITOR_BID" exists only in records written by Phase 1B (1d21f06). Since Phase 1B.1 (D2) it is never
+ * produced: an old bid is not an executable exit price. It stays in the type so older journals still load.
+ */
 export type ExitBasis = "CURRENT_QUOTE" | "LAST_VALID_MONITOR_BID" | "NONE";
+/** Whether the exit was valued from executable bids observed at exit time (Phase 1B.1, D2). */
+export type ExitValuationStatus = "EXECUTABLE_QUOTE" | "DATA_INSUFFICIENT";
 export type ExitTrigger = "USER_EXIT" | "EXPIRY" | "HOLDING_LIMIT";
 
 export interface PaperExitRecord {
@@ -232,6 +257,10 @@ export interface PaperExitRecord {
   exitPremium: number | null;
   exitCosts: number | null;
   notes: string[];
+  /** Phase 1B.1 (D2). Absent on records written by Phase 1B. */
+  valuationStatus?: ExitValuationStatus;
+  /** Phase 1B.1 (D2): the last valid monitored bids, kept for HISTORICAL REFERENCE ONLY. Never used for P&L. */
+  staleReference?: LastValidExit | null;
 }
 
 export interface PaperMonitorSnapshot {
@@ -276,6 +305,7 @@ export const PAPER_JOURNAL_EVENT_TYPES = [
   "TRADE_OPENED",
   "MONITOR_SNAPSHOT",
   "EXIT_REJECTED_DATA_INSUFFICIENT",
+  "CONFIRM_REJECTED_QUOTE",
   "TRADE_EXITED",
   "TRADE_EXPIRED",
   "TRADE_AUTO_CLOSED",
@@ -331,6 +361,7 @@ export type PaperErrorCode =
   | "DATA_INSUFFICIENT"
   | "CAPITAL_GATE_FAILED"
   | "LOTS_UNRESOLVED"
+  | "QUOTE_NOT_FRESH"
   | "STORAGE_ERROR";
 
 export interface ApiErrorBody {

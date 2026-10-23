@@ -59,11 +59,28 @@ otherwise net is null and labelled `COSTS_UNAVAILABLE`. If any required executab
 with a reason. It is never estimated and never shown as zero. Worked check (legacy numbers): asks 69.8 + 50.95 = 120.75, bids 66.05 + 54.00 = 120.05,
 one lot of 65 → gross **−45.50**.
 
+## Confirmation needs fresh quotes (Phase 1B.1)
+
+A trade opens only with `confirmed: true` **and** a fresh executable quote for **every** leg, sent with the confirmation:
+`{ "confirmed": true, "quotes": [{ "instrument": {...}, "bid": …, "ask": …, "asOf": "2026-09-28T10:00:05+05:30", … }, …] }`.
+
+- Each quote must be for the **exact** stored instrument. A quote for another strike, expiry or instrument is refused (`INVALID_REQUEST`), never substituted.
+- Each quote needs a valid **bid and ask** (ask ≥ bid). LTP, theoretical, model and review-time prices are never used (`DATA_INSUFFICIENT`).
+- Each quote needs its own time (`asOf`): a full timestamp **with a zone**. It is checked against the **server clock**: it may be at most
+  **60 seconds old** (approved policy) and at most the allowed clock skew in the future. A missing, invalid, ambiguous, stale or future time is refused
+  (`QUOTE_NOT_FRESH`). For manually typed prices, the web app stamps each leg with the moment its prices were typed.
+- A refused confirmation is journaled (`CONFIRM_REJECTED_QUOTE`) and the trade **stays in `PAPER_REVIEW`**, so it can be confirmed again with fresh prices.
+- Entry premium, capital (and the capital gate) and entry risk are **recalculated** from the fresh quotes. The review record keeps the review-time numbers as history.
+- Spot, trading days to expiry, expected and implied move, expected net edge and score are the candidate's values (supplied at review). They are not
+  re-priced at confirmation; the snapshot records their time as `candidateAsOf`.
+
 ## Entry snapshot (immutable)
 
 Recorded once, at confirmation, and frozen: candidate identity, market, structure, expiry, strikes, each leg's entry ask (and bid),
 combined entry premium, lot size, lots, spot, expected move, implied move, expected net edge, score, **entry risk** (with its inputs and rules
 version), capital assessment and requirement, timestamp, and a **data-completeness** record listing any market data that was missing.
+Since Phase 1B.1 (`snapshotVersion: 2`) it also records each leg's **quote time** (`quoteAsOf`) and **age at confirmation** (`quoteAgeMs`),
+the freshness rule applied (`quoteFreshness`) and `candidateAsOf`. Snapshots written by Phase 1B (`snapshotVersion: 1`) remain readable.
 It is deeply frozen in memory, and the journal refuses any attempt to change or replace it.
 
 ## Entry risk versus current risk
@@ -78,22 +95,40 @@ The rules are in `RISK_ENGINE.md`.
 `monitor` records current bids (and, for risk, asks, volume, open interest and depth), the current exit premium, the unrealized P&L and the current
 risk. Valid bids are remembered as the *last valid exit*. An invalid update (a missing bid) records `DATA_INSUFFICIENT` and **does not overwrite** the last valid exit.
 
+## Time and freshness (Phase 1B.1)
+
+- The **server clock** is the only trusted time. It is injected into the service (`now`), so tests are deterministic.
+- Client times (`asOf` on monitor, exit and safety check) are **untrusted**. When supplied they must be a full timestamp with a zone, must not be
+  earlier than the trade's last recorded update (at least the entry snapshot), and must not be later than server time plus the allowed skew. Otherwise the
+  request is refused (`INVALID_REQUEST`) and nothing changes. When omitted, server time is used.
+- Allowed clock skew: **5 seconds** (`TIME_RULES.maxFutureSkewMs`). This is a DEFAULT engineering value with no source in the specification; it awaits owner review.
+- Quote freshness at confirmation: **60 seconds** (`TIME_RULES.maxQuoteAgeMs`, approved).
+
 ## Expiry and safety (deterministic; no invented prices)
+
+Expiry and safety are decided on **server time** only. A client `asOf` on the safety check is validated and recorded (`clientAsOf`) but never decides anything,
+so a future-dated client time cannot force expiry.
 
 | Rule | Trigger | Result |
 |---|---|---|
-| Expiry | the as-of **date** is after the expiry date | `PAPER_EXPIRED` |
+| Expiry | the server time's calendar **date in Asia/Kolkata** is after the expiry date | `PAPER_EXPIRED` |
 | Holding limit | `completedSessions` ≥ **2** (the frozen forward protocol) | `PAPER_AUTO_CLOSED` |
 
-- The expiry **day itself is not treated as expired**, because market hours are not configured yet.
+- Expiry dates are NSE dates, read in **Asia/Kolkata** (IST). The date is computed in that zone, never by cutting the first ten characters off a timestamp,
+  so `2026-10-06T22:30:00Z` (04:00 IST on the 7th) counts as the 7th.
+- The expiry **day itself is not treated as expired**, because market hours (an intraday cutoff) are not configured yet. A contract counts as expired from
+  **00:00 Asia/Kolkata on the day after** its expiry date. No holiday or expiry calendar is assumed.
 - There is no trading calendar, so `completedSessions` must be **supplied**. If it is not, the holding limit is reported as **not evaluated**. It is never estimated.
 - If both apply, expiry wins.
-- The lifecycle event is **always recorded**. The exit price comes from, in order: (1) valid bids supplied in the call (`CURRENT_QUOTE`); (2) the last valid monitored bids
-  (`LAST_VALID_MONITOR_BID`, clearly labelled as *not a current quote*); (3) nothing: the exit price is null, the basis is `NONE`, and P&L is `DATA_INSUFFICIENT`.
+- The lifecycle event is **always recorded**. The exit is valued **only** from valid CE/PE bids supplied in the call (basis `CURRENT_QUOTE`,
+  `valuationStatus: EXECUTABLE_QUOTE`). Otherwise there is no exit price: basis `NONE`, `valuationStatus: DATA_INSUFFICIENT`, P&L `DATA_INSUFFICIENT`.
+- **Phase 1B.1 (D2):** an earlier monitored bid is **never** used as the exit price. If one exists it is kept on the exit record as `staleReference`,
+  labelled *historical reference only*, and it is not used for P&L. (Phase 1B priced such closures from it with basis `LAST_VALID_MONITOR_BID`; that basis is no longer produced.)
+- Lifecycle state (`PAPER_EXPIRED` / `PAPER_AUTO_CLOSED`), valuation status and P&L status are separate fields.
 
 ## Journal events
 
-`REVIEW_STARTED`, `REJECTED_DATA_INSUFFICIENT`, `TRADE_OPENED`, `MONITOR_SNAPSHOT`, `EXIT_REJECTED_DATA_INSUFFICIENT`, `TRADE_EXITED`, `TRADE_EXPIRED`, `TRADE_AUTO_CLOSED`.
+`REVIEW_STARTED`, `REJECTED_DATA_INSUFFICIENT`, `TRADE_OPENED`, `MONITOR_SNAPSHOT`, `EXIT_REJECTED_DATA_INSUFFICIENT`, `CONFIRM_REJECTED_QUOTE` (Phase 1B.1), `TRADE_EXITED`, `TRADE_EXPIRED`, `TRADE_AUTO_CLOSED`.
 Events are append-only with strictly increasing sequence numbers. A refused exit (missing bid) is journaled and the trade stays `PAPER_OPEN`.
 
 ## API (all under `/api/paper`; JSON only)
@@ -102,10 +137,10 @@ Events are append-only with strictly increasing sequence numbers. A refused exit
 |---|---|---|
 | `POST /assess` | Evaluate a candidate. Stores nothing. | 400 invalid |
 | `POST /review` | Store a `PAPER_REVIEW` trade (201). | 422 `DATA_INSUFFICIENT` (stored as a final record) |
-| `POST /trades/:id/confirm` | Open it. Body `{ "confirmed": true }`. | 400 `CONFIRMATION_REQUIRED`; 422 `CAPITAL_GATE_FAILED` / `LOTS_UNRESOLVED`; 409 wrong state |
-| `POST /trades/:id/monitor` | Record current prices, risk and unrealized P&L. | 409 if not `PAPER_OPEN` |
-| `POST /trades/:id/exit` | Exit at valid bids. | 422 `DATA_INSUFFICIENT` (trade stays open) |
-| `POST /trades/:id/safety-check` | Apply expiry / holding-limit rules. | 409 if not `PAPER_OPEN` |
+| `POST /trades/:id/confirm` | Open it. Body `{ "confirmed": true, "quotes": [fresh quotes with asOf] }`. | 400 `CONFIRMATION_REQUIRED` / `INVALID_REQUEST` (wrong instrument); 422 `QUOTE_NOT_FRESH` / `DATA_INSUFFICIENT` / `CAPITAL_GATE_FAILED` / `LOTS_UNRESOLVED`; 409 wrong state |
+| `POST /trades/:id/monitor` | Record current prices, risk and unrealized P&L. | 400 bad `asOf`; 409 if not `PAPER_OPEN` |
+| `POST /trades/:id/exit` | Exit at valid bids. | 400 bad `asOf`; 422 `DATA_INSUFFICIENT` (trade stays open) |
+| `POST /trades/:id/safety-check` | Apply expiry / holding-limit rules on server time. | 400 bad `asOf`; 409 if not `PAPER_OPEN` |
 | `GET /trades?state=&risk=` | List; `risk` is `ALL`, `LOW`, `MEDIUM` or `HIGH`. | 400 bad filter |
 | `GET /trades/:id` | One trade and its events. | 404 |
 | `GET /journal?tradeId=` | Events. | |

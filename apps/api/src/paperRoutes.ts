@@ -14,6 +14,7 @@ const STATUS: Readonly<Record<PaperErrorCode, number>> = {
   DATA_INSUFFICIENT: 422,
   CAPITAL_GATE_FAILED: 422,
   LOTS_UNRESOLVED: 422,
+  QUOTE_NOT_FRESH: 422,
   STORAGE_ERROR: 500,
 };
 

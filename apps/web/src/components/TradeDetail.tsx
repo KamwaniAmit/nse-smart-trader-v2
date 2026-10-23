@@ -83,18 +83,33 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
       <p>
         Entry premium (sum of asks): <strong>{inr(premium)}</strong> per unit · lot size {trade.candidate.lotSize} · lots {num(entry ? entry.lots : capital.lots)}
       </p>
-      <table>
-        <thead>
-          <tr><th>Leg</th><th>Strike</th><th>Ask (entry)</th><th>Bid at entry</th></tr>
-        </thead>
-        <tbody>
-          {trade.candidate.legs.map((l) => (
-            <tr key={l.instrument.id}>
-              <td>{l.optionType}</td><td>{l.strike}</td><td>{num(l.quote.ask)}</td><td>{num(l.quote.bid)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {entry ? (
+        <table>
+          <thead>
+            <tr><th>Leg</th><th>Strike</th><th>Ask (entry)</th><th>Bid at entry</th><th>Quote time</th></tr>
+          </thead>
+          <tbody>
+            {entry.legs.map((l) => (
+              <tr key={l.instrument.id}>
+                <td>{l.optionType}</td><td>{l.strike}</td><td>{num(l.entryAsk)}</td><td>{num(l.entryBid)}</td><td>{l.quoteAsOf ?? "not recorded (v1 snapshot)"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <table>
+          <thead>
+            <tr><th>Leg</th><th>Strike</th><th>Ask (review)</th><th>Bid (review)</th></tr>
+          </thead>
+          <tbody>
+            {trade.candidate.legs.map((l) => (
+              <tr key={l.instrument.id}>
+                <td>{l.optionType}</td><td>{l.strike}</td><td>{num(l.quote.ask)}</td><td>{num(l.quote.bid)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
       <p>
         Capital requirement {inr(capital.totalCapitalRequirement)} per lot (premium {inr(capital.premiumRequirement)} + costs {inr(capital.entryCosts)}) · allocation {inr(capital.maxCapitalAllocation)} · gate <strong>{capital.gate}</strong>
         {capital.utilizationPct !== null ? ` · utilization ${capital.utilizationPct}%` : ""}
@@ -128,7 +143,13 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
           {trade.exit ? (
             <p className="hint">
               {trade.exit.trigger} · price basis {trade.exit.basis}
+              {trade.exit.valuationStatus ? ` · valuation ${trade.exit.valuationStatus}` : ""}
               {trade.exit.priceAsOf ? ` (as of ${trade.exit.priceAsOf})` : ""} · exit premium {inr(trade.exit.exitPremium)} {trade.exit.notes.join(" ")}
+            </p>
+          ) : null}
+          {trade.exit?.staleReference ? (
+            <p className="hint" data-stale-reference="true">
+              Reference only (not an exit price, not used for P&amp;L): last valid monitored bids as of {trade.exit.staleReference.asOf}, exit premium {inr(trade.exit.staleReference.exitPremium)}.
             </p>
           ) : null}
         </>
@@ -140,17 +161,22 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
       ) : null}
 
       {trade.state === "PAPER_REVIEW" ? (
-        <fieldset>
-          <legend>Confirm paper trade</legend>
+        <>
           <p>Nothing is open yet. Confirming records the entry snapshot and opens a PAPER trade. No real order is ever placed.</p>
-          <label>
-            <input type="checkbox" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} />
-            I confirm this paper trade
-          </label>{" "}
-          <button type="button" disabled={!confirmed || busy} onClick={() => void run(async () => void (await confirmTrade(trade.tradeId, { confirmed: true })), "Paper trade opened.")}>
-            Confirm paper trade
-          </button>
-        </fieldset>
+          <p className="hint">
+            The review prices above are history. A paper trade opens only at FRESH prices: enter the current bid and ask for each leg (at most 60 seconds old). Entry premium, capital and entry risk are recalculated from them.
+          </p>
+          <QuoteForm
+            title="Confirm paper trade" legs={legs} extended timestamped disabled={!confirmed || busy} submitLabel="Confirm paper trade" extra={[]}
+            beforeSubmit={
+              <label>
+                <input type="checkbox" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} />
+                I confirm this paper trade
+              </label>
+            }
+            onSubmit={(quotes) => void run(async () => void (await confirmTrade(trade.tradeId, { confirmed: true, quotes })), "Paper trade opened.")}
+          />
+        </>
       ) : null}
 
       {trade.state === "PAPER_OPEN" ? (
@@ -166,11 +192,11 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
           />
           <QuoteForm
             title="Safety check" legs={legs} disabled={busy} submitLabel="Run safety check"
-            extra={[{ key: "asOf", label: "As of (YYYY-MM-DD or timestamp)" }, { key: "completedSessions", label: "Completed sessions (optional)", hint: "No trading calendar exists: if blank, the holding limit is not evaluated." }, costs]}
+            extra={[{ key: "completedSessions", label: "Completed sessions (optional)", hint: "No trading calendar exists: if blank, the holding limit is not evaluated. Expiry is judged on the server clock (Asia/Kolkata dates)." }, costs]}
             onSubmit={(quotes, x) =>
               void run(
                 async () => {
-                  const res = await safetyCheck(trade.tradeId, { asOf: x["asOf"] ?? "", completedSessions: optNum(x["completedSessions"]), quotes, exitCosts: optNum(x["exitCosts"]) });
+                  const res = await safetyCheck(trade.tradeId, { completedSessions: optNum(x["completedSessions"]), quotes, exitCosts: optNum(x["exitCosts"]) });
                   if (res.decision.action === "NONE") return `No safety closure applies. ${res.decision.notEvaluated.join(" ")}`.trim();
                   return undefined;
                 },

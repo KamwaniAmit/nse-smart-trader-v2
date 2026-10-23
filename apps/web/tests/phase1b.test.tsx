@@ -127,6 +127,13 @@ describe("Best Opportunities: single leg and the risk filter", () => {
   });
 });
 
+const fillFreshQuotes = () => {
+  setField("Confirm paper trade: CE 22900 bid", "70");
+  setField("Confirm paper trade: CE 22900 ask", "70.5");
+  setField("Confirm paper trade: PE 22800 bid", "50.6");
+  setField("Confirm paper trade: PE 22800 ask", "51.25");
+};
+
 describe("Paper Trading: review -> confirm", () => {
   const list = (trades: PaperTradeRecord[]) => ({ "GET /api/paper/trades": () => ({ body: { trades } }) });
 
@@ -141,9 +148,52 @@ describe("Paper Trading: review -> confirm", () => {
     fireEvent.click(screen.getByLabelText("I confirm this paper trade"));
     expect(confirm).toBeEnabled();
     expect(posts(calls, "/confirm")).toHaveLength(0); // ticking is not confirming
+    fillFreshQuotes();
     fireEvent.click(confirm);
     await waitFor(() => expect(posts(calls, "/confirm")).toHaveLength(1));
-    expect(posts(calls, "/confirm")[0]?.body).toEqual({ confirmed: true });
+    expect(posts(calls, "/confirm")[0]?.body).toMatchObject({ confirmed: true });
+  });
+
+  // Phase 1B.1 (D1): the confirmation carries FRESH prices for the exact legs, each with the time it was typed.
+  it("the confirmation sends fresh bid/ask quotes for the EXACT stored legs, each stamped with when it was typed", async () => {
+    const t = makeTrade("PAPER_REVIEW");
+    const calls = stubApi({ ...list([t]), [`GET /api/paper/trades/${t.tradeId}`]: () => ({ body: { trade: t, events: [] } }), [`POST /api/paper/trades/${t.tradeId}/confirm`]: () => ({ body: makeTrade("PAPER_OPEN") }) });
+    at("/paper-trading");
+    fireEvent.click(await screen.findByRole("button", { name: `Open ${t.tradeId}` }));
+    await screen.findByRole("button", { name: "Confirm paper trade" });
+    const before = Date.now();
+    fillFreshQuotes();
+    fireEvent.click(screen.getByLabelText("I confirm this paper trade"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm paper trade" }));
+    await waitFor(() => expect(posts(calls, "/confirm")).toHaveLength(1));
+    const body = posts(calls, "/confirm")[0]?.body as { confirmed: boolean; quotes: Array<{ instrument: { id: string }; bid: number; ask: number; asOf: string }> };
+    expect(body.confirmed).toBe(true);
+    expect(body.quotes.map((q) => [q.instrument.id, q.bid, q.ask])).toEqual([
+      ["NIFTY|2026-10-06|CE|22900", 70, 70.5],
+      ["NIFTY|2026-10-06|PE|22800", 50.6, 51.25],
+    ]);
+    for (const q of body.quotes) {
+      expect(Date.parse(q.asOf)).toBeGreaterThanOrEqual(before);
+      expect(Date.parse(q.asOf)).toBeLessThanOrEqual(Date.now());
+    }
+    expect(screen.getByText(/at most 60 seconds old/)).toBeInTheDocument();
+  });
+
+  it("a stale-quote refusal (QUOTE_NOT_FRESH) is shown, and the trade stays in review", async () => {
+    const t = makeTrade("PAPER_REVIEW");
+    stubApi({
+      ...list([t]),
+      [`GET /api/paper/trades/${t.tradeId}`]: () => ({ body: { trade: t, events: [] } }),
+      [`POST /api/paper/trades/${t.tradeId}/confirm`]: () => ({ status: 422, body: { error: "QUOTE_NOT_FRESH", message: "Entry quotes must be at most 60 s old by server time. The trade stays in PAPER_REVIEW.", details: ["CE 22900: quote is older than 60 s"], trade: t } }),
+    });
+    at("/paper-trading");
+    fireEvent.click(await screen.findByRole("button", { name: `Open ${t.tradeId}` }));
+    await screen.findByRole("button", { name: "Confirm paper trade" });
+    fillFreshQuotes();
+    fireEvent.click(screen.getByLabelText("I confirm this paper trade"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm paper trade" }));
+    expect(await screen.findByText(/at most 60 s old by server time/)).toBeInTheDocument();
+    expect(screen.getByText("CE 22900: quote is older than 60 s")).toBeInTheDocument();
   });
 
   it("shows entry premium (sum of asks), capital and the capital gate during review", async () => {
@@ -229,14 +279,17 @@ describe("Paper Trading: open trade", () => {
     });
   });
 
-  it("a safety check sends asOf and completed sessions, and reports when no closure applies", async () => {
+  // Phase 1B.1 (D3): the safety check no longer asks the user for a date. The server clock decides expiry.
+  it("a safety check sends completed sessions but NO client date (server time decides), and reports when no closure applies", async () => {
     const calls = setup(open, { [`POST /api/paper/trades/${open.tradeId}/safety-check`]: () => ({ body: { decision: { action: "NONE", reasons: [], notEvaluated: ["HOLDING_LIMIT not evaluated: completedSessions was not supplied (no trading calendar exists yet)."] }, trade: open } }) });
     await openIt();
-    fireEvent.change(await screen.findByLabelText("Safety check: As of (YYYY-MM-DD or timestamp)"), { target: { value: "2026-10-01" } });
+    expect(screen.queryByLabelText(/Safety check: As of/)).toBeNull();
     fireEvent.click(await screen.findByRole("button", { name: "Run safety check" }));
     expect(await screen.findByText(/No safety closure applies/)).toBeInTheDocument();
     expect(screen.getByText(/HOLDING_LIMIT not evaluated/)).toBeInTheDocument();
-    expect(posts(calls, "/safety-check")[0]?.body).toMatchObject({ asOf: "2026-10-01", completedSessions: null });
+    const body = posts(calls, "/safety-check")[0]?.body as Record<string, unknown>;
+    expect(body).toMatchObject({ completedSessions: null });
+    expect(body).not.toHaveProperty("asOf");
   });
 });
 
@@ -262,6 +315,32 @@ describe("Paper Trading: history, journal, export", () => {
     expect(screen.getAllByText(/Unavailable \(DATA_INSUFFICIENT\)/).length).toBeGreaterThanOrEqual(2); // list row and detail
     fireEvent.click(screen.getByRole("button", { name: "Open pt_rejected" }));
     expect(await screen.findByText(/this candidate had no executable entry price and was not opened/)).toBeInTheDocument();
+  });
+
+  // Phase 1B.1 (D2): an old monitored bid is shown as reference only; valuation and P&L stay DATA_INSUFFICIENT.
+  it("an expiry without current bids shows valuation DATA_INSUFFICIENT and the old monitored bid as reference only", async () => {
+    const expired = makeTrade("PAPER_EXPIRED", {
+      tradeId: "pt_stale",
+      exit: {
+        timestamp: "2026-10-07T03:50:00Z", trigger: "EXPIRY", basis: "NONE", priceAsOf: null, legBids: [], exitPremium: null, exitCosts: null,
+        notes: ["No valid executable bid for every leg at closure, so there is no exit price and P&L is DATA_INSUFFICIENT."],
+        valuationStatus: "DATA_INSUFFICIENT",
+        staleReference: { asOf: "2026-09-29T10:00:00+05:30", legBids: [], exitPremium: 120.05 },
+      },
+      realizedPnl: { status: "DATA_INSUFFICIENT", reason: "No valid executable exit price (every leg needs a positive bid). P&L is not estimated.", grossPnl: null, netPnl: null, netStatus: "DATA_INSUFFICIENT" },
+    });
+    stubApi({
+      "GET /api/paper/trades": () => ({ body: { trades: [expired] } }),
+      "GET /api/paper/trades/pt_stale": () => ({ body: { trade: expired, events: [] } }),
+    });
+    at("/paper-trading");
+    fireEvent.click(await screen.findByRole("tab", { name: "History" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open pt_stale" }));
+    expect(await screen.findByText(/valuation DATA_INSUFFICIENT/)).toBeInTheDocument();
+    const ref = screen.getByText(/Reference only \(not an exit price, not used for P&L\)/);
+    expect(ref).toHaveTextContent("2026-09-29T10:00:00+05:30");
+    expect(ref).toHaveTextContent("₹120.05");
+    expect(screen.getAllByText(/Unavailable \(DATA_INSUFFICIENT\)/).length).toBeGreaterThanOrEqual(1);
   });
 
   it("Journal tab lists events and offers the JSON export with the durability warning", async () => {

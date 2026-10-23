@@ -25,6 +25,11 @@ const raw = (over: Record<string, unknown> = {}) => ({
   ],
   spot: 22850, tradingDaysToExpiry: 8, maxCapitalAllocation: 100000, entryCosts: 250, requestedLots: 1, ...over,
 });
+/** Phase 1B.1 (D1): a confirmation carries fresh quotes for the exact legs, timed at the service clock below (10:00 UTC). */
+const freshConfirm = (t: PaperTradeRecord) => ({
+  confirmed: true,
+  quotes: t.candidate.legs.map((l) => ({ instrument: l.instrument, ...l.quote, asOf: "2026-09-28T10:00:00Z" })),
+});
 const make = (path = file) => {
   let n = 0;
   const repository = new FileJournalRepository({ filePath: path, now: () => "2026-09-28T12:00:00Z" });
@@ -61,7 +66,7 @@ describe("FileJournalRepository: basic operations", () => {
     const s = make();
     const t = await review(s);
     expect((await s.repository.getTrade(t.tradeId))?.state).toBe("PAPER_REVIEW");
-    const c = await s.service.confirm(t.tradeId, { confirmed: true });
+    const c = await s.service.confirm(t.tradeId, freshConfirm(t));
     expect(c.ok && c.value.state).toBe("PAPER_OPEN");
     expect((await s.repository.listTrades({ states: ["PAPER_OPEN"] })).length).toBe(1);
     expect((await s.repository.listEvents({ tradeId: t.tradeId })).map((e) => e.type)).toEqual(["REVIEW_STARTED", "TRADE_OPENED"]);
@@ -86,7 +91,7 @@ describe("FileJournalRepository: persistence and reload", () => {
   it("a NEW repository instance reads back exactly what was stored, including the immutable entry snapshot", async () => {
     const a = make();
     const t = await review(a);
-    const opened = await a.service.confirm(t.tradeId, { confirmed: true });
+    const opened = await a.service.confirm(t.tradeId, freshConfirm(t));
     if (!opened.ok) throw new Error("confirm failed");
 
     const b = make();
@@ -108,7 +113,7 @@ describe("FileJournalRepository: persistence and reload", () => {
   it("after a reload the lifecycle continues: monitor, exit and the final state persist", async () => {
     const a = make();
     const t = await review(a);
-    await a.service.confirm(t.tradeId, { confirmed: true });
+    await a.service.confirm(t.tradeId, freshConfirm(t));
     const ids = t.candidate.legs.map((l) => l.instrument);
     const b = make();
     const exited = await b.service.exit(t.tradeId, { quotes: [{ instrument: ids[0], bid: 95 }, { instrument: ids[1], bid: 85 }] });

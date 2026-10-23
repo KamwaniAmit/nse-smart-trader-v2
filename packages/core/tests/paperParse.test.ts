@@ -115,10 +115,13 @@ describe("request parsing: confirm, monitor, exit, safety check", () => {
     expect(parseExitRequest({}).ok).toBe(false);
     expect(parseExitRequest({ quotes: [{ bid: 5 }] }).ok).toBe(false);
   });
-  it("safety check needs asOf; completedSessions must be a whole number", () => {
-    expect(parseSafetyCheckRequest({}).ok).toBe(false);
-    expect(parseSafetyCheckRequest({ asOf: "2026-10-07" }).ok).toBe(true);
-    expect(parseSafetyCheckRequest({ asOf: "2026-10-07", completedSessions: 1.5 }).ok).toBe(false);
+  // Phase 1B.1 (D3): asOf is now OPTIONAL and untrusted (the server clock decides expiry and safety), and an event
+  // time must be a full timestamp with a zone. A bare date is ambiguous and is rejected.
+  it("safety check: asOf is optional but must be a full timestamp with a zone; completedSessions must be a whole number", () => {
+    expect(parseSafetyCheckRequest({}).ok).toBe(true);
+    expect(parseSafetyCheckRequest({ asOf: "2026-10-07T09:20:00+05:30" }).ok).toBe(true);
+    expect(parseSafetyCheckRequest({ asOf: "2026-10-07" }).ok).toBe(false);
+    expect(parseSafetyCheckRequest({ completedSessions: 1.5 }).ok).toBe(false);
     expect(parseSafetyCheckRequest({ asOf: "not a date" }).ok).toBe(false);
   });
 });
