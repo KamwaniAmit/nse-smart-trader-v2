@@ -36,6 +36,7 @@ function TradeTable({ trades, selectedId, onSelect }: { trades: readonly ListedT
                 {t.priceQuality?.level === "HISTORICAL_SNAPSHOT" || t.priceQuality?.flags.includes("UNREALIZED_SNAPSHOT_AFTER_CUTOFF") ? <><br /><span className="notice">historical snapshot (before expiry cutoff); not a current price, not exchange-verified</span></> : null}
                 {t.priceQuality ? <><br /><span className="hint" title={t.priceQuality.note}>{t.priceQuality.level}</span></> : null}
                 {t.expiryStatus && (t.expiryStatus.status === "EXPIRED_PENDING_CLOSURE" || t.expiryStatus.status === "EXPIRED_REVIEW") ? <><br /><span className="notice">{t.expiryStatus.status}</span></> : null}
+                {t.expiryStatus?.instrumentCheck !== undefined && t.expiryStatus.instrumentCheck !== "CONSISTENT" ? <><br /><span className="notice" data-instrument-check={t.expiryStatus.instrumentCheck}>Instrument identity unverified ({t.expiryStatus.instrumentCheck}): pricing and actions restricted</span></> : null}
               </td>
               <td><button type="button" onClick={() => onSelect(t.tradeId)}>Open {t.tradeId}</button></td>
             </tr>

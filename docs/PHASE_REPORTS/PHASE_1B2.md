@@ -62,6 +62,11 @@ Run on `6f1fd0b` plus the final-review change, in a clean checkout (Linux, Node 
 The owner reported Windows results for `6efbeeb` (742 / 742) and `6f1fd0b` (754 / 754), each with the build OK and `git diff --check`
 clean, and should re-run `npm.cmd run check`, `npm.cmd run build` and `git diff --check` after applying the final-review change.
 
+**Later owner-reported verification (Windows, 2026-10-26).** At commit `ed0f604` (the final-review change plus one added test),
+`npm.cmd run check` passed **814 / 814** tests across **26 / 26** test files and `npm.cmd run build` succeeded; `git diff --check` was clean.
+Commit `1841cc9` changes only this report's test inventory (documentation), so those results apply to its code. The 813 above is the
+earlier run and is kept as recorded. Neither run covers any change made after `1841cc9`.
+
 **GitHub CI has not run.** The repository has no workflow under `.github/workflows`, and PR #1 shows 0 checks. All results above are local.
 
 ### Test inventory

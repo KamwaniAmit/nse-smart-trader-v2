@@ -228,14 +228,31 @@ Events are append-only with strictly increasing sequence numbers. A refused exit
 |---|---|---|
 | `POST /assess` | Evaluate a candidate. Stores nothing. | 400 invalid; 409 `CONTRACT_EXPIRED` |
 | `POST /review` | Store a `PAPER_REVIEW` trade (201). | 422 `DATA_INSUFFICIENT` (stored as a final record); 409 `CONTRACT_EXPIRED` |
-| `POST /trades/:id/confirm` | Open it. Body `{ "confirmed": true, "quotes": [fresh quotes with asOf] }`. | 400 `CONFIRMATION_REQUIRED` / `INVALID_REQUEST` (wrong instrument); 422 `QUOTE_NOT_FRESH` / `DATA_INSUFFICIENT` / `CAPITAL_GATE_FAILED` / `LOTS_UNRESOLVED`; 409 wrong state or `CONTRACT_EXPIRED` |
-| `POST /trades/:id/monitor` | Record current prices (bid, ask and `asOf` per leg), risk and unrealized P&L. | 400 bad `asOf` / foreign instrument; 409 if not `PAPER_OPEN` or `CONTRACT_EXPIRED` |
-| `POST /trades/:id/exit` | Exit at checked manual prices (bid, ask and `asOf` per leg). | 400 bad `asOf` / foreign instrument; 409 `CONTRACT_EXPIRED`; 422 `DATA_INSUFFICIENT` / `QUOTE_NOT_FRESH` (trade stays open) |
+| `POST /trades/:id/confirm` | Open it. Body `{ "confirmed": true, "quotes": [fresh quotes with asOf] }`. | 400 `CONFIRMATION_REQUIRED` / `INVALID_REQUEST` (wrong instrument); 422 `QUOTE_NOT_FRESH` / `DATA_INSUFFICIENT` / `CAPITAL_GATE_FAILED` / `LOTS_UNRESOLVED`; 409 wrong state or `CONTRACT_EXPIRED`; 422 `DATA_INSUFFICIENT` for an older record whose instruments are not `CONSISTENT` (see note below) |
+| `POST /trades/:id/monitor` | Record current prices (bid, ask and `asOf` per leg), risk and unrealized P&L. | 400 bad `asOf` / foreign instrument; 409 if not `PAPER_OPEN` or `CONTRACT_EXPIRED`; 422 `DATA_INSUFFICIENT` for an older record whose instruments are not `CONSISTENT` (see note below) |
+| `POST /trades/:id/exit` | Exit at checked manual prices (bid, ask and `asOf` per leg). | 400 bad `asOf` / foreign instrument; 409 `CONTRACT_EXPIRED`; 422 `DATA_INSUFFICIENT` / `QUOTE_NOT_FRESH` (trade stays open); 422 `DATA_INSUFFICIENT` for an older record whose instruments are not `CONSISTENT` (see note below) |
 | `POST /trades/:id/safety-check` | Apply expiry / holding-limit rules on server time. | 400 bad `asOf` / foreign instrument; 409 if not `PAPER_OPEN` |
 | `GET /trades?state=&risk=` | List; `risk` is `ALL`, `LOW`, `MEDIUM` or `HIGH`. | 400 bad filter |
 | `GET /trades/:id` | One trade and its events. | 404 |
 | `GET /journal?tradeId=` | Events. | |
 | `GET /export` | Whole journal as a JSON download. | |
+
+**Older records whose instruments are not `CONSISTENT` (final review).** Confirm, monitor and exit on such a record are refused with HTTP 422
+`DATA_INSUFFICIENT`. The request is refused **before** its prices and times are read, and **nothing is written**: no state change and **no
+journal event**. This is deliberate, and it differs from refusals that are journaled:
+
+| Refusal | Journal event written |
+|---|---|
+| Confirm at or after the cutoff (409 `CONTRACT_EXPIRED`) | `CONFIRM_REJECTED_EXPIRED` |
+| Confirm with stale, missing or invalid quotes (422 `QUOTE_NOT_FRESH` / `DATA_INSUFFICIENT`) | `CONFIRM_REJECTED_QUOTE` |
+| Exit at or after the cutoff (409 `CONTRACT_EXPIRED`) | `EXIT_REJECTED_EXPIRED` |
+| Exit with stale or future-dated prices (422 `QUOTE_NOT_FRESH`) | `EXIT_REJECTED_QUOTE` |
+| Exit with missing, crossed or ambiguous prices (422 `DATA_INSUFFICIENT`) | `EXIT_REJECTED_DATA_INSUFFICIENT` |
+| Monitor at or after the cutoff (409 `CONTRACT_EXPIRED`) | none |
+| Confirm, monitor or exit on an older record whose instruments are not `CONSISTENT` (422 `DATA_INSUFFICIENT`) | **none** |
+
+The expiry check runs first, so at or after the cutoff such a record gets 409 `CONTRACT_EXPIRED` (journaled as listed above for confirm and
+exit). The safety check is not refused for such a record: it closes it unpriced (see "Instrument identity" above).
 
 There is no route to delete or edit a trade, and **no order, broker, login or authentication route** (a guard test enforces the exact list).
 

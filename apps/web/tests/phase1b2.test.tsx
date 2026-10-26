@@ -254,3 +254,32 @@ describe("final review: an older record whose instruments do not verifiably iden
     expect(await screen.findByText(/Contract expired at 15:30 IST on 2026-10-01/)).toBeInTheDocument();
   });
 });
+
+describe("review finding 4: the trade list flags records whose instrument identity is not verified", () => {
+  const listed = (check: string) =>
+    withView(makeTrade("PAPER_OPEN", { tradeId: `pt_list_${check}` }), {
+      expiryStatus: { status: "BEFORE_CUTOFF", cutoff: "2026-10-06T15:30:00+05:30", expiryUsed: "2026-10-06", instrumentCheck: check, instrumentReasons: check === "CONSISTENT" ? [] : ["CE 22900: x"] },
+    });
+  const showList = async (check: string) => {
+    stubApi({ "GET /api/paper/trades": () => ({ body: { trades: [listed(check)] } }) });
+    at("/paper-trading");
+    await screen.findByRole("button", { name: `Open pt_list_${check}` });
+  };
+
+  it("CONSISTENT: no instrument-identity warning", async () => {
+    await showList("CONSISTENT");
+    expect(screen.queryByText(/Instrument identity unverified/)).toBeNull();
+    expect(document.querySelector("[data-instrument-check]")).toBeNull();
+  });
+  it.each(["MISMATCH", "UNVERIFIABLE"])("%s: the warning is visible in the list", async (check) => {
+    await showList(check);
+    expect(screen.getByText(`Instrument identity unverified (${check}): pricing and actions restricted`)).toBeInTheDocument();
+    expect(document.querySelector(`[data-instrument-check="${check}"]`)).not.toBeNull();
+  });
+  it("a response without instrumentCheck (older API) shows no warning", async () => {
+    stubApi({ "GET /api/paper/trades": () => ({ body: { trades: [withView(makeTrade("PAPER_OPEN", { tradeId: "pt_list_none" }))] } }) });
+    at("/paper-trading");
+    await screen.findByRole("button", { name: "Open pt_list_none" });
+    expect(screen.queryByText(/Instrument identity unverified/)).toBeNull();
+  });
+});
