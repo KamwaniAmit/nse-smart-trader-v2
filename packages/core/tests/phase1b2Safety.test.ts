@@ -994,6 +994,25 @@ describe("final review: instrument identity on stored records, HISTORICAL_SNAPSH
     expect(q.flags).toContain("INSTRUMENT_IDENTITY_UNVERIFIED");
   });
 
+  it("an unverifiable instrument remains flagged when an open trade becomes a historical snapshot", () => {
+    const t = sample("journal-b91fa26.json")["pt_b91fa26-open"] as unknown as Any;
+    t["candidate"]["legs"][0]["instrument"] = { provider: "p", id: "abc" };
+
+    const rec = t as unknown as PaperTradeRecord;
+    const before = assessPriceQuality(rec, Date.parse(LAST_MS_BEFORE));
+    expect(before.flags).toContain("INSTRUMENT_IDENTITY_UNVERIFIED");
+
+    const after = assessPriceQuality(rec, Date.parse(CUTOFF));
+    expect(after.level).toBe("HISTORICAL_SNAPSHOT");
+    expect(after.flags).toContain("INSTRUMENT_IDENTITY_UNVERIFIED");
+    expect(after.flags).toContain("UNREALIZED_SNAPSHOT_AFTER_CUTOFF");
+    expect(after.warnings).toHaveLength(after.flags.length);
+
+    for (const text of [after.note, ...after.warnings]) {
+      expect(text).not.toMatch(CLAIMS_VERIFICATION);
+    }
+  });
+
   it("a stored open trade whose instrument names an EARLIER expiry becomes a historical snapshot at THAT cutoff (boundary pinned)", () => {
     const t = sample("journal-b91fa26.json")["pt_b91fa26-open"] as unknown as Any;
     t["candidate"]["legs"][0]["instrument"] = man("NIFTY|2026-10-01|CE|22900");
