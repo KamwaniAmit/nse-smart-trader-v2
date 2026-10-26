@@ -68,7 +68,7 @@ clean, and should re-run `npm.cmd run check`, `npm.cmd run build` and `git diff 
 
 | | Phase 1B.1 (`b91fa26`) | Phase 1B.2 (this branch) |
 |---|---|---|
-| Tests | 573 (23 files) | **813** (26 files) |
+| Tests | 573 (23 files) | **814** (26 files) |
 
 - 567 of the 573 Phase 1B.1 test names are unchanged. Some of them had approved minimal input changes (for example the six approved test
   corrections: an ask and an entry time added to bid-only exit quotes, a later fixture expiry for the 10-day stale-quote case, the
@@ -78,11 +78,11 @@ clean, and should re-run `npm.cmd run check`, `npm.cmd run build` and `git diff 
 - **1 test in `paperParse.test.ts` was rewritten** (final review): "keeps a supplied instrument identity exactly" used an opaque instrument
   (`{ provider: "p", id: "abc" }`) whose expiry cannot be verified, which is now refused. It now keeps a consistent manual instrument exactly;
   the opaque case has its own refusal test.
-- **240 tests are new:** `packages/core/tests/phase1b2Safety.test.ts` 170, `apps/api/tests/phase1b2Api.test.ts` 27,
+- **241 tests are new:** `packages/core/tests/phase1b2Safety.test.ts` 171, `apps/api/tests/phase1b2Api.test.ts` 27,
   `apps/web/tests/phase1b2.test.tsx` 21, `packages/core/tests/paperParse.test.ts` 22.
-- 813 = 567 unchanged names + 6 rewritten + 240 new.
+- 814 = 567 unchanged names + 6 rewritten + 241 new.
 - Final review against `6f1fd0b` (754): 746 names unchanged, 8 renamed because their expectation changed intentionally (5 core and 2 web M1
-  tests now expect `HISTORICAL_SNAPSHOT` / the "when recorded" wording; 1 parse test above), 59 new.
+  tests now expect `HISTORICAL_SNAPSHOT` / the "when recorded" wording; 1 parse test above), 60 new.
 - The Phase 1A test files are unchanged against `main`.
 - `packages/core/src/paper/pricing.ts` (LONG VOL formulas) and `package-lock.json` are unchanged against `main`.
 
