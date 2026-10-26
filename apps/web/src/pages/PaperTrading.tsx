@@ -33,7 +33,7 @@ function TradeTable({ trades, selectedId, onSelect }: { trades: readonly ListedT
               <td>
                 {pnl ? pnlText(pnl) : <span className="hint">n/a</span>}
                 {!t.realizedPnl && t.lastMonitor ? <><br /><span className="hint">recorded {t.lastMonitor.asOf}</span></> : null}
-                {t.priceQuality?.flags.includes("UNREALIZED_SNAPSHOT_AFTER_CUTOFF") ? <><br /><span className="notice">historical snapshot (before expiry cutoff); not a current valuation</span></> : null}
+                {t.priceQuality?.level === "HISTORICAL_SNAPSHOT" || t.priceQuality?.flags.includes("UNREALIZED_SNAPSHOT_AFTER_CUTOFF") ? <><br /><span className="notice">historical snapshot (before expiry cutoff); not a current price, not exchange-verified</span></> : null}
                 {t.priceQuality ? <><br /><span className="hint" title={t.priceQuality.note}>{t.priceQuality.level}</span></> : null}
                 {t.expiryStatus && (t.expiryStatus.status === "EXPIRED_PENDING_CLOSURE" || t.expiryStatus.status === "EXPIRED_REVIEW") ? <><br /><span className="notice">{t.expiryStatus.status}</span></> : null}
               </td>

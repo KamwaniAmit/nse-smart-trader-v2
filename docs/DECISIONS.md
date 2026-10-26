@@ -51,6 +51,15 @@ Each numbered item shows its status. Items marked **DECIDED** were settled by th
    - **D8** Names as proposed, plus `PROVENANCE_INCOMPLETE`, `PROVENANCE_INCONSISTENT` and `priceQuality.note`.
    - **D9** Tests are kept with the implementation when a test-only commit would not compile.
 
+6. **Phase 1B.2 final review (owner instruction, after the review of PR #1).**
+   - **Instrument identity:** an explicit leg instrument must be the manual format whose market, expiry, option type and strike equal the
+     structured fields exactly; anything else (including opaque providers) is refused (`INVALID_REQUEST`). Older records are not rewritten; the
+     cutoff uses the earliest readable expiry; a record that is not `CONSISTENT` cannot be confirmed, monitored, exited or priced, and can only be
+     closed unpriced by the safety check (holding limit or expiry).
+   - **Historical snapshot:** a dedicated derived level `HISTORICAL_SNAPSHOT` for an open trade's recorded unrealized P&L read at or after the cutoff.
+   - **Stale-age warning before the cutoff: DEFERRED.** No threshold is approved, and the stored times do not show when prices were observed.
+     The UI no longer describes a recorded exit premium as "now". Decide a threshold (and its evidence) before adding an age warning.
+
 ## Open notes and known limitations (Phase 1B)
 
 - **Risk rules are an uncalibrated first table.** `RISK_ENGINE.md` (rules v1.0.0) labels every number as LEGACY, SPEC, STRUCTURAL or DEFAULT. The DEFAULT values have no source in the specification and are proposals awaiting owner approval. No outcome data exists to validate any of them.

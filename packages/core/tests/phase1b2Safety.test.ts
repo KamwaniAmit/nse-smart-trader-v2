@@ -14,7 +14,7 @@
 //                         itself is expired); 15:29:59.999 IST is the last moment of normal actions.
 import { describe, expect, it } from "vitest";
 import type { PaperTradeRecord } from "../src/index.js";
-import { EXPIRY_CUTOFF, TIME_RULES, assessPriceQuality, evaluateSafety } from "../src/index.js";
+import { EXPIRY_CUTOFF, TIME_RULES, assessPriceQuality, checkInstruments, evaluateSafety } from "../src/index.js";
 import { CE_ID, PE_ID, confirmBody, longVolRaw, makeService, opened, reviewed } from "./fixtures.js";
 // Historical samples written by the real 1d21f06 and b91fa26 builds (see fixtures/journals/README.md). Read-only.
 import journal1d21f06 from "./fixtures/journals/journal-1d21f06.json" with { type: "json" };
@@ -875,12 +875,13 @@ describe("M1: an unrealized P&L snapshot read at or after the cutoff is never la
   });
 
   it.each([["at the cutoff instant", CUTOFF], ["one ms after", FIRST_MS_AFTER], ["after the close", AFTER_CLOSE]])(
-    "%s the same snapshot is NO_PRICE with the historical-snapshot flag; the stored snapshot is unchanged",
+    "%s the same snapshot is HISTORICAL_SNAPSHOT with the historical-snapshot flag; the stored snapshot is unchanged",
     async (_n, readAt) => {
       const { svc, id, snapshot } = await monitored();
       svc.clock.set(readAt);
       const t = view(ok(await svc.service.getTrade(id)).trade);
-      expect(t["priceQuality"]["level"]).toBe("NO_PRICE");
+      // Final review: a dedicated level. A recorded figure exists, so NO_PRICE ("no valid P&L") would be inaccurate.
+      expect(t["priceQuality"]["level"]).toBe("HISTORICAL_SNAPSHOT");
       expect(t["priceQuality"]["flags"]).toEqual([FLAG]);
       expect(t["priceQuality"]["warnings"][0]).toMatch(/historical snapshot, not a current or executable valuation/);
       expect(t["priceQuality"]["note"]).toContain(`recorded by the server at ${String(snapshot?.asOf)}`);
@@ -888,7 +889,9 @@ describe("M1: an unrealized P&L snapshot read at or after the cutoff is never la
       expect(t["priceQuality"]["note"]).not.toMatch(CLAIMS_VERIFICATION);
       expect(t["expiryStatus"]).toMatchObject({ status: "EXPIRED_PENDING_CLOSURE" });
       expect(t["lastMonitor"]).toEqual(snapshot); // the stored record is reported as it is, never rewritten
-      expect((await svc.service.listTrades())[0]?.priceQuality).toMatchObject({ level: "NO_PRICE", flags: [FLAG] });
+      expect(t["priceQuality"]["note"]).toMatch(/not a current or executable valuation, it is not exchange-verified, and it is not realized P&L/);
+      expect(t["realizedPnl"]).toBeNull(); // display only: nothing is realized
+      expect((await svc.service.listTrades())[0]?.priceQuality).toMatchObject({ level: "HISTORICAL_SNAPSHOT", flags: [FLAG] });
     },
   );
 
@@ -922,7 +925,7 @@ describe("M1: an unrealized P&L snapshot read at or after the cutoff is never la
   });
 
   it.each([["journal-1d21f06.json", "pt_1d21f06-open"], ["journal-b91fa26.json", "pt_b91fa26-open"]])(
-    "historical %s open trade keeps its legacy flags; after the cutoff it is NO_PRICE with the snapshot flag (record not modified)",
+    "historical %s open trade keeps its legacy flags; after the cutoff it is HISTORICAL_SNAPSHOT with the snapshot flag (record not modified)",
     (file, id) => {
       const t = sample(file)[id] as PaperTradeRecord;
       const stored = JSON.stringify(t);
@@ -931,8 +934,8 @@ describe("M1: an unrealized P&L snapshot read at or after the cutoff is never la
       expect(before.flags).toContain("UNREALIZED_FROM_UNCHECKED_MONITOR");
       expect(before.flags).not.toContain(FLAG);
       const after = assessPriceQuality(t, Date.parse(CUTOFF));
-      expect(after.level).toBe("NO_PRICE");
-      expect(after.flags).toEqual([...before.flags, FLAG]);
+      expect(after.level).toBe("HISTORICAL_SNAPSHOT");
+      expect(after.flags).toEqual([...before.flags, FLAG]); // the unchecked-monitor warning is kept
       expect(after.warnings).toHaveLength(after.flags.length);
       for (const text of [after.note, ...after.warnings]) expect(text).not.toMatch(CLAIMS_VERIFICATION);
       expect(JSON.stringify(t)).toBe(stored);
@@ -944,6 +947,109 @@ describe("M1: an unrealized P&L snapshot read at or after the cutoff is never la
     for (const t of allSampleTrades().filter((x) => x.state !== "PAPER_OPEN")) {
       expect(assessPriceQuality(t, Date.parse(AFTER_CLOSE)).flags).not.toContain(FLAG);
       expect(assessPriceQuality(t, Date.parse(AFTER_CLOSE))).toEqual(assessPriceQuality(t));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Final review: instrument expiry on STORED records, the dedicated HISTORICAL_SNAPSHOT level, and no freshness claims.
+describe("final review: instrument identity on stored records, HISTORICAL_SNAPSHOT and freshness wording", () => {
+  const legsWith = (ids: Array<{ provider: string; id: string }>) => ids.map((instrument, i) => ({ optionType: i === 0 ? "CE" : "PE", strike: 22900 - i * 100, instrument }));
+  const man = (id: string) => ({ provider: "manual", id });
+  const PE_OK = man("NIFTY|2026-10-06|PE|22800");
+
+  it.each([
+    ["consistent legs", [man("NIFTY|2026-10-06|CE|22900"), PE_OK], "2026-10-06", "CONSISTENT", 0],
+    ["an earlier instrument expiry (the earliest date wins)", [man("NIFTY|2026-10-01|CE|22900"), PE_OK], "2026-10-01", "MISMATCH", 1],
+    ["a later instrument expiry (never extends the cutoff)", [man("NIFTY|2026-12-29|CE|22900"), PE_OK], "2026-10-06", "MISMATCH", 1],
+    ["another market", [man("BANKNIFTY|2026-10-06|CE|22900"), PE_OK], "2026-10-06", "MISMATCH", 1],
+    ["another option type", [man("NIFTY|2026-10-06|PE|22900"), PE_OK], "2026-10-06", "MISMATCH", 1],
+    ["another strike", [man("NIFTY|2026-10-06|CE|23000"), PE_OK], "2026-10-06", "MISMATCH", 1],
+    ["a strike written differently (no normalisation)", [man("NIFTY|2026-10-06|CE|22900.0"), PE_OK], "2026-10-06", "MISMATCH", 1],
+    ["an opaque provider", [{ provider: "p", id: "abc" }, PE_OK], "2026-10-06", "UNVERIFIABLE", 1],
+    ["a malformed expiry", [man("NIFTY|2026-13-40|CE|22900"), PE_OK], "2026-10-06", "UNVERIFIABLE", 1],
+    ["an empty part", [man("|2026-10-06|CE|22900"), PE_OK], "2026-10-06", "UNVERIFIABLE", 1],
+  ])("checkInstruments with %s", (_n, ids, expiryUsed, check, nReasons) => {
+    const candidate = { marketId: "NIFTY", expiry: "2026-10-06", legs: legsWith(ids) } as unknown as Parameters<typeof checkInstruments>[0];
+    const before = JSON.stringify(candidate);
+    const r = checkInstruments(candidate);
+    expect(r).toMatchObject({ expiryUsed, check });
+    expect(r.reasons).toHaveLength(nReasons);
+    expect(JSON.stringify(candidate)).toBe(before); // never rewritten
+  });
+
+  it("every sample record (1d21f06, b91fa26) is CONSISTENT, so its behaviour is unchanged", () => {
+    for (const t of allSampleTrades()) expect(checkInstruments(t.candidate)).toEqual({ expiryUsed: t.candidate.expiry, check: "CONSISTENT", reasons: [] });
+  });
+
+  it("a stored record whose instruments are not CONSISTENT is never shown as checked: INSTRUMENT_IDENTITY_UNVERIFIED", () => {
+    const t = sample("journal-b91fa26.json")["pt_b91fa26-userExit"] as unknown as Any;
+    // a record written by 6f1fd0b with a checked exit, but an opaque instrument (accepted before the final review)
+    Object.assign(t["exit"], { valuationStatus: "MANUAL_ENTRY_CHECKED", priceProvenance: "MANUAL_USER_ENTRY" });
+    t["exit"]["legBids"] = t["exit"]["legBids"].map((b: Any) => ({ ...b, ask: b["bid"] + 0.5, enteredAt: "2026-09-30T05:29:50.000Z", entryAgeMs: 10_000 }));
+    expect(assessPriceQuality(t as unknown as PaperTradeRecord).level).toBe("MANUAL_ENTRY_CHECKED");
+    t["candidate"]["legs"][0]["instrument"] = { provider: "p", id: "abc" };
+    const q = assessPriceQuality(t as unknown as PaperTradeRecord);
+    expect(q.level).toBe("UNVERIFIED_LEGACY");
+    expect(q.flags).toContain("INSTRUMENT_IDENTITY_UNVERIFIED");
+  });
+
+  it("a stored open trade whose instrument names an EARLIER expiry becomes a historical snapshot at THAT cutoff (boundary pinned)", () => {
+    const t = sample("journal-b91fa26.json")["pt_b91fa26-open"] as unknown as Any;
+    t["candidate"]["legs"][0]["instrument"] = man("NIFTY|2026-10-01|CE|22900");
+    const rec = t as unknown as PaperTradeRecord;
+    expect(assessPriceQuality(rec, Date.parse("2026-10-01T09:59:59.999Z")).flags).not.toContain("UNREALIZED_SNAPSHOT_AFTER_CUTOFF");
+    const at = assessPriceQuality(rec, Date.parse("2026-10-01T10:00:00.000Z"));
+    expect(at.level).toBe("HISTORICAL_SNAPSHOT");
+    expect(at.note).toContain("2026-10-01T15:30:00+05:30");
+  });
+
+  it("missing price data after the cutoff stays NO_PRICE (no figure exists, so it is not a historical snapshot)", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    ok(await svc.service.monitor(id, manualAt(svc.clock.peek(), { ce: [66.05, null] })));
+    svc.clock.set(FIRST_MS_AFTER);
+    const t = view(ok(await svc.service.getTrade(id)).trade);
+    expect(t["lastMonitor"]["unrealized"]["status"]).toBe("DATA_INSUFFICIENT");
+    expect(t["priceQuality"]).toMatchObject({ level: "NO_PRICE", flags: [] });
+  });
+
+  it("an open trade with no monitor update after the cutoff is NO_PRICE (nothing recorded)", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    svc.clock.set(CUTOFF);
+    expect(view(ok(await svc.service.getTrade(id)).trade)["priceQuality"]).toMatchObject({ level: "NO_PRICE", flags: [] });
+  });
+
+  it("HISTORICAL_SNAPSHOT is display-only: the expiry closure, realized P&L and lifecycle are exactly as before", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    ok(await svc.service.monitor(id, manualAt(svc.clock.peek())));
+    svc.clock.set(CUTOFF);
+    expect(view(ok(await svc.service.getTrade(id)).trade)["priceQuality"]["level"]).toBe("HISTORICAL_SNAPSHOT");
+    const r = ok(await svc.service.runSafetyCheck(id, {}));
+    expect(r.trade).toMatchObject({ state: "PAPER_EXPIRED", exit: { basis: "NONE", exitPremium: null, valuationStatus: "DATA_INSUFFICIENT" }, realizedPnl: { status: "DATA_INSUFFICIENT", grossPnl: null } });
+    expect(await types(svc, id)).toEqual(["REVIEW_STARTED", "TRADE_OPENED", "MONITOR_SNAPSHOT", "TRADE_EXPIRED"]);
+  });
+
+  // Item 3 (deferred stale-age policy): an old snapshot BEFORE the cutoff keeps its level (no threshold is invented), and
+  // no level, note or warning claims the price is current, live, fresh or real-time.
+  const FRESHNESS_CLAIM = /\b(current price is|live|real-?time|fresh|up[- ]to[- ]date|latest market)\b/i;
+  it("a checked snapshot read days later (before the cutoff) is unchanged and makes no freshness claim", async () => {
+    const svc = makeService();
+    const id = await opened(svc);
+    ok(await svc.service.monitor(id, manualAt(svc.clock.peek())));
+    svc.clock.set("2026-10-05T10:00:00.000Z"); // 7 days later, still before the cutoff
+    const q = view(ok(await svc.service.getTrade(id)).trade)["priceQuality"];
+    expect(q).toMatchObject({ level: "MANUAL_ENTRY_CHECKED", flags: [] });
+    for (const text of [q["note"], ...q["warnings"]]) expect(String(text)).not.toMatch(FRESHNESS_CLAIM);
+  });
+  it("no sample record's derived note or warnings claim freshness, before or after the cutoff", () => {
+    for (const t of allSampleTrades()) {
+      for (const at of [LAST_MS_BEFORE, AFTER_CLOSE]) {
+        const q = assessPriceQuality(t, Date.parse(at));
+        for (const text of [q.note, ...q.warnings]) expect(text).not.toMatch(FRESHNESS_CLAIM);
+      }
     }
   });
 });

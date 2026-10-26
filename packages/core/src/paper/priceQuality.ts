@@ -1,4 +1,5 @@
 import type { ExitLegPrice, PaperPnl, PaperTradeRecord, PriceQualityDTO, PriceQualityFlag, PriceQualityLevel } from "../contracts/index.js";
+import { checkInstruments } from "./instrumentIdentity.js";
 import { expiryCutoffInstant, expiryCutoffMs } from "./safety.js";
 import { TIME_RULES, parseStrictTimestamp } from "./time.js";
 
@@ -21,14 +22,17 @@ const WARNINGS: Readonly<Record<PriceQualityFlag, string>> = {
   ACTION_AFTER_EXPIRY_CUTOFF: "The trade was opened or exited at or after the contract's 15:30 IST paper-safety cutoff. This is no longer allowed.",
   PROVENANCE_INCOMPLETE: "The record claims checked manual prices, but the entry times, ask or provenance needed to show that are missing.",
   PROVENANCE_INCONSISTENT: "The record claims checked manual prices, but its recorded values do not satisfy the manual-input rules.",
+  INSTRUMENT_IDENTITY_UNVERIFIED:
+    "Older record: the legs' instruments do not verifiably match the market, expiry, option type and strike, so the prices recorded for them are not attributed to a verified contract.",
   UNREALIZED_SNAPSHOT_AFTER_CUTOFF:
     "The contract has reached its provisional 15:30 IST paper-safety cutoff. The unrealized P&L shown is a historical snapshot, not a current or executable valuation.",
 };
 
 /** M1: the note when an open trade is read at or after its cutoff. `recordedAt` is the server time of the snapshot. */
 const afterCutoffNote = (recordedAt: string, cutoff: string): string =>
-  `There is no current price: the contract reached its provisional paper-safety cutoff (${cutoff}). The unrealized P&L shown was recorded by the server at ${recordedAt} ` +
-  "and is a historical snapshot only, not a current or executable valuation. Run the safety check: the expiry closure is unpriced (no approved settlement-price source).";
+  `Historical snapshot: the contract reached its provisional paper-safety cutoff (${cutoff}). The unrealized P&L shown was recorded by the server at ${recordedAt}; ` +
+  "it is not a current or executable valuation, it is not exchange-verified, and it is not realized P&L. There is no current price. " +
+  "Run the safety check: the expiry closure is unpriced (no approved settlement-price source).";
 
 const NOTES: Readonly<Record<PriceQualityLevel, string>> = {
   MANUAL_ENTRY_CHECKED:
@@ -36,6 +40,9 @@ const NOTES: Readonly<Record<PriceQualityLevel, string>> = {
   UNVERIFIED_LEGACY: "The prices behind this P&L were not checked by the current manual-input rules. Treat the figure as unverified.",
   SUPERSEDED_RULE: "This P&L was produced by a rule that is no longer allowed. It is kept as history only.",
   NO_PRICE: "There is no valid P&L for this trade, so there is no price to assess.",
+  // Used only through afterCutoffNote (which names the recorded time); kept here so every level has a note.
+  HISTORICAL_SNAPSHOT:
+    "The contract reached its provisional paper-safety cutoff. The unrealized P&L shown is a historical snapshot recorded earlier; it is not a current or executable valuation, it is not exchange-verified, and it is not realized P&L.",
 };
 
 const isCheckedLeg = (b: ExitLegPrice): boolean =>
@@ -68,11 +75,14 @@ export function assessPriceQuality(trade: PaperTradeRecord, nowMs?: number): Pri
   const add = (f: PriceQualityFlag): void => {
     if (!flags.includes(f)) flags.push(f);
   };
-  const cutoffMs = safeCutoffMs(trade.candidate.expiry);
+  const ids = checkInstruments(trade.candidate); // final review: never later than a readable instrument expiry
+  const expiryUsed = ids.expiryUsed;
+  const cutoffMs = safeCutoffMs(expiryUsed);
 
   const entry = trade.entry;
   const exit = trade.exit;
   if (entry !== null && entry.snapshotVersion === 1) add("LEGACY_ENTRY_SNAPSHOT_V1");
+  if (ids.check !== "CONSISTENT") add("INSTRUMENT_IDENTITY_UNVERIFIED"); // never upgraded to MANUAL_ENTRY_CHECKED
   if (entry !== null && atOrAfter(entry.capturedAt, cutoffMs)) add("ACTION_AFTER_EXPIRY_CUTOFF");
 
   let pnl: PaperPnl | null = null;
@@ -106,11 +116,12 @@ export function assessPriceQuality(trade: PaperTradeRecord, nowMs?: number): Pri
 
   let level: PriceQualityLevel;
   const afterCutoff = flags.includes("UNREALIZED_SNAPSHOT_AFTER_CUTOFF");
-  if (pnl === null || pnl.status !== "VALID" || afterCutoff) level = "NO_PRICE";
+  if (pnl === null || pnl.status !== "VALID") level = "NO_PRICE";
+  else if (afterCutoff) level = "HISTORICAL_SNAPSHOT"; // a recorded figure exists, but it is not a current price
   else if (flags.some((f) => f === "PRICED_FROM_EARLIER_MONITOR_BID" || f === "EXPIRY_PRICED_FROM_TYPED_BIDS" || f === "ACTION_AFTER_EXPIRY_CUTOFF")) level = "SUPERSEDED_RULE";
   else if (flags.some((f) => f !== "SESSION_COUNT_USER_PROVIDED")) level = "UNVERIFIED_LEGACY";
   else level = "MANUAL_ENTRY_CHECKED";
 
-  const note = afterCutoff && trade.lastMonitor !== null ? afterCutoffNote(trade.lastMonitor.asOf, expiryCutoffInstant(trade.candidate.expiry)) : NOTES[level];
+  const note = afterCutoff && trade.lastMonitor !== null ? afterCutoffNote(trade.lastMonitor.asOf, expiryCutoffInstant(expiryUsed)) : NOTES[level];
   return { level, flags, warnings: flags.map((f) => WARNINGS[f]), note };
 }

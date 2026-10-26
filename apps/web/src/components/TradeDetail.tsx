@@ -65,9 +65,14 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
 
   const costs: ExtraField = { key: "exitCosts", label: "Exit costs (₹, optional)" };
   const quality = trade.priceQuality;
-  /** M1: the server says the unrealized P&L is a snapshot from before the contract's cutoff. */
-  const historicalSnapshot = quality?.flags.includes("UNREALIZED_SNAPSHOT_AFTER_CUTOFF") ?? false;
+  /** M1 / final review: the server says the unrealized P&L is a historical snapshot (read at or after the cutoff). */
+  const historicalSnapshot = quality?.level === "HISTORICAL_SNAPSHOT" || (quality?.flags.includes("UNREALIZED_SNAPSHOT_AFTER_CUTOFF") ?? false);
   const expiryStatus = trade.expiryStatus?.status;
+  /** Final review: the expiry the safety rules use (an older record may name an earlier instrument expiry). */
+  const expiryUsed = trade.expiryStatus?.expiryUsed ?? trade.candidate.expiry;
+  const instrumentCheck = trade.expiryStatus?.instrumentCheck;
+  /** Final review: an older record whose instruments do not verifiably identify its contract: no confirm, monitor or exit. */
+  const unverifiedInstruments = instrumentCheck === "MISMATCH" || instrumentCheck === "UNVERIFIABLE";
   const exit = trade.exit;
   const manualChecked = exit?.valuationStatus === "MANUAL_ENTRY_CHECKED";
 
@@ -137,8 +142,8 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
       {trade.state === "PAPER_OPEN" ? (
         trade.lastMonitor ? (
           <>
-            <PnlLine label={historicalSnapshot ? "Unrealized P&L (historical snapshot from before the expiry cutoff; not a current or executable valuation)" : "Unrealized P&L"} pnl={trade.lastMonitor.unrealized} />
-            <p className="hint">Recorded by the server at {trade.lastMonitor.asOf} (processing time; these quotes carry no observation time). Exit premium {historicalSnapshot ? "at that time" : "now"} {inr(trade.lastMonitor.currentExitPremium)} (sum of bids). {trade.lastMonitor.dataReasons.join("; ")}</p>
+            <PnlLine label={historicalSnapshot ? "Unrealized P&L (historical snapshot recorded before the expiry cutoff; not a current or executable price, not exchange-verified, not realized P&L)" : "Unrealized P&L"} pnl={trade.lastMonitor.unrealized} />
+            <p className="hint">Recorded by the server at {trade.lastMonitor.asOf} (processing time; these quotes carry no observation time). Exit premium when recorded {inr(trade.lastMonitor.currentExitPremium)} (sum of bids); not refreshed since. {trade.lastMonitor.dataReasons.join("; ")}</p>
           </>
         ) : (
           <p>Not monitored yet: no executable bids have been recorded.</p>
@@ -190,12 +195,23 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
         </p>
       ) : null}
 
+      {unverifiedInstruments ? (
+        <div className="notice" data-instrument-check={instrumentCheck}>
+          <p>
+            {instrumentCheck === "MISMATCH"
+              ? `Older record: a leg's instrument does not match its market, expiry, option type or strike (instrument check MISMATCH). The expiry cutoff uses the earliest date named, ${expiryUsed}.`
+              : `Older record: a leg's instrument could not be verified (instrument check UNVERIFIABLE). The expiry cutoff uses the candidate expiry, ${expiryUsed}, which is NOT verified.`}{" "}
+            No price can be attributed to this record: it cannot be confirmed, monitored or exited. An open trade can only be closed, unpriced, by the safety check.
+          </p>
+          {(trade.expiryStatus?.instrumentReasons ?? []).length > 0 ? <ul>{(trade.expiryStatus?.instrumentReasons ?? []).map((r) => <li key={r}>{r}</li>)}</ul> : null}
+        </div>
+      ) : null}
       {trade.state === "PAPER_REVIEW" && expiryStatus === "EXPIRED_REVIEW" ? (
         <p className="notice" data-expiry-status="EXPIRED_REVIEW">
-          This review&apos;s contract expired at 15:30 IST on {trade.candidate.expiry} (provisional paper-safety cutoff), so it cannot be confirmed. It stays in PAPER_REVIEW as history.
+          This review&apos;s contract expired at 15:30 IST on {expiryUsed} (provisional paper-safety cutoff), so it cannot be confirmed. It stays in PAPER_REVIEW as history.
         </p>
       ) : null}
-      {trade.state === "PAPER_REVIEW" && expiryStatus !== "EXPIRED_REVIEW" ? (
+      {trade.state === "PAPER_REVIEW" && expiryStatus !== "EXPIRED_REVIEW" && !unverifiedInstruments ? (
         <>
           <p>Nothing is open yet. Confirming records the entry snapshot and opens a PAPER trade. No real order is ever placed.</p>
           <p className="hint">
@@ -216,10 +232,10 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
 
       {trade.state === "PAPER_OPEN" && expiryStatus === "EXPIRED_PENDING_CLOSURE" ? (
         <p className="notice" data-expiry-status="EXPIRED_PENDING_CLOSURE">
-          Contract expired at 15:30 IST on {trade.candidate.expiry} (provisional paper-safety cutoff). Monitoring and exit are closed; run the safety check to record the expiry closure. There is no approved settlement-price source, so its P&amp;L will be DATA_INSUFFICIENT.
+          Contract expired at 15:30 IST on {expiryUsed} (provisional paper-safety cutoff). Monitoring and exit are closed; run the safety check to record the expiry closure. There is no approved settlement-price source, so its P&amp;L will be DATA_INSUFFICIENT.
         </p>
       ) : null}
-      {trade.state === "PAPER_OPEN" && expiryStatus !== "EXPIRED_PENDING_CLOSURE" ? (
+      {trade.state === "PAPER_OPEN" && expiryStatus !== "EXPIRED_PENDING_CLOSURE" && !unverifiedInstruments ? (
         <>
           <QuoteForm
             title="Monitor" legs={legs} extended timestamped disabled={busy} submitLabel="Record monitor update"

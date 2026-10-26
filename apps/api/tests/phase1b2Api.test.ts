@@ -2,7 +2,7 @@
 // contract, and the historical journal samples written by 1d21f06 and b91fa26. Samples are COPIED to a temp folder;
 // the originals are never modified. Every manual price carries an entry time PASSED BY THE TEST (normally serverNow(),
 // the injected server clock's current time); no helper reads a clock implicitly.
-import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request } from "node:http";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -217,5 +217,150 @@ describe.each([["journal-1d21f06.json", "1d21f06", 8, 22], ["journal-b91fa26.jso
     const port = await start();
     expect((await call(port, "POST", `/api/paper/trades/${reviewId}/confirm`, confirmBody(serverNow()))).status).toBe(409);
     expect((await call(port, "GET", `/api/paper/trades/${reviewId}`)).body.trade.expiryStatus).toMatchObject({ status: "EXPIRED_REVIEW" });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Final review: instrument identity. New candidates must be consistent. OLDER records (copied from the b91fa26 sample and
+// edited in the temp copy only) are never rewritten and stay readable; a record that is not CONSISTENT is never confirmed,
+// monitored, exited or priced, and can only be closed unpriced. The cutoff is never later than a readable instrument expiry.
+describe("final review: instrument identity (HTTP)", () => {
+  const withInstruments = (ceId: string, peId: string) => ({ ...candidate(), legs: [
+    { optionType: "CE", strike: 22900, instrument: { provider: "manual", id: ceId }, quote: { bid: 69.0, ask: 69.8, ...depth } },
+    { optionType: "PE", strike: 22800, instrument: { provider: "manual", id: peId }, quote: { bid: 50.2, ask: 50.95, ...depth } },
+  ] });
+
+  it.each([
+    ["market", "BANKNIFTY|2026-10-06|CE|22900", /instrument market "BANKNIFTY" does not match the market "NIFTY"/],
+    ["expiry", "NIFTY|2026-12-29|CE|22900", /instrument expiry "2026-12-29" does not match the expiry "2026-10-06"/],
+    ["option type", "NIFTY|2026-10-06|PE|22900", /instrument option type "PE" does not match the option type "CE"/],
+    ["strike", "NIFTY|2026-10-06|CE|23000", /instrument strike "23000" does not match the strike "22900"/],
+  ])("assess and review refuse a %s mismatch with 400 INVALID_REQUEST; nothing is stored", async (_n, ceId, message) => {
+    const port = await start();
+    const bad = withInstruments(ceId, "NIFTY|2026-10-06|PE|22800");
+    const a = await call(port, "POST", "/api/paper/assess", bad);
+    expect(a.status).toBe(400);
+    expect(a.body.error).toBe("INVALID_REQUEST");
+    expect(a.body.details.join(" ")).toMatch(message);
+    expect((await call(port, "POST", "/api/paper/review", bad)).status).toBe(400);
+    expect((await call(port, "GET", "/api/paper/trades")).body.trades).toEqual([]);
+  });
+
+  it("a consistent explicit instrument is accepted and reported CONSISTENT", async () => {
+    const port = await start();
+    const good = await call(port, "POST", "/api/paper/review", withInstruments("NIFTY|2026-10-06|CE|22900", "NIFTY|2026-10-06|PE|22800"));
+    expect(good.status).toBe(201);
+    expect(good.body.expiryStatus).toMatchObject({ status: "BEFORE_CUTOFF", expiryUsed: "2026-10-06", instrumentCheck: "CONSISTENT", instrumentReasons: [] });
+  });
+
+  /** A temp copy of the b91fa26 sample whose trade `id` has its legs' instruments replaced (the original is untouched). */
+  const seedLegacy = async (id: string, ids: [unknown, unknown]): Promise<string> => {
+    const j = JSON.parse(await readFile(join(SAMPLES, "journal-b91fa26.json"), "utf8")) as { trades: Record<string, { candidate: { legs: Array<{ instrument: unknown }> } }> };
+    const legs = j.trades[id]?.candidate.legs ?? [];
+    legs.forEach((l, i) => (l.instrument = ids[i]));
+    const text = JSON.stringify(j, null, 2);
+    await writeFile(file, text, "utf8");
+    return text;
+  };
+  const OPEN = "pt_b91fa26-open";
+  const OPAQUE: [unknown, unknown] = [{ provider: "p", id: "abc" }, { provider: "manual", id: "NIFTY|2026-10-06|PE|22800" }];
+  /** Valid, fresh manual prices for the legs exactly as stored (so only the instrument rule can refuse them). */
+  const pricesFor = (legs: Array<{ instrument: unknown }>, at: string) => ({
+    quotes: [{ instrument: legs[0]?.instrument, bid: 66.05, ask: 66.55, asOf: at }, { instrument: legs[1]?.instrument, bid: 54, ask: 54.5, asOf: at }],
+  });
+
+  it("UNVERIFIABLE older open trade, before the cutoff: readable and flagged; monitor and exit refused (422, nothing written)", async () => {
+    const stored = await seedLegacy(OPEN, OPAQUE);
+    setClock("2026-10-02T04:30:00.000Z");
+    const port = await start();
+    const g = await call(port, "GET", `/api/paper/trades/${OPEN}`);
+    expect(g.status).toBe(200);
+    expect(g.body.trade.expiryStatus).toMatchObject({ status: "BEFORE_CUTOFF", expiryUsed: "2026-10-06", instrumentCheck: "UNVERIFIABLE" });
+    expect(g.body.trade.expiryStatus.instrumentReasons.join(" ")).toMatch(/CE 22900: a "p" instrument cannot be verified/);
+    expect(g.body.trade.priceQuality.flags).toContain("INSTRUMENT_IDENTITY_UNVERIFIED");
+    expect(g.body.trade.priceQuality.level).not.toBe("MANUAL_ENTRY_CHECKED");
+    const legs = g.body.trade.candidate.legs;
+    for (const action of ["monitor", "exit"]) {
+      const r = await call(port, "POST", `/api/paper/trades/${OPEN}/${action}`, pricesFor(legs, serverNow()));
+      expect(r.status).toBe(422);
+      expect(r.body.error).toBe("DATA_INSUFFICIENT");
+      expect(r.body.message).toMatch(/do not verifiably identify its contract \(UNVERIFIABLE\)/);
+    }
+    expect(await readFile(file, "utf8")).toBe(stored); // refused before anything is written
+  });
+
+  it("UNVERIFIABLE older open trade: a holding-limit closure is UNPRICED even with valid prices", async () => {
+    await seedLegacy(OPEN, OPAQUE);
+    setClock("2026-10-02T04:30:00.000Z");
+    const port = await start();
+    const legs = (await call(port, "GET", `/api/paper/trades/${OPEN}`)).body.trade.candidate.legs;
+    const s = await call(port, "POST", `/api/paper/trades/${OPEN}/safety-check`, { completedSessions: 2, ...pricesFor(legs, serverNow()) });
+    expect(s.status).toBe(200);
+    expect(s.body.decision.action).toBe("AUTO_CLOSE");
+    expect(s.body.trade).toMatchObject({ state: "PAPER_AUTO_CLOSED", exit: { trigger: "HOLDING_LIMIT", basis: "NONE", exitPremium: null, valuationStatus: "DATA_INSUFFICIENT", priceProvenance: "NONE" }, realizedPnl: { status: "DATA_INSUFFICIENT" } });
+    expect(s.body.trade.exit.notes.join(" ")).toMatch(/Not priced: the instruments do not verifiably identify this contract \(UNVERIFIABLE\)/);
+  });
+
+  it("UNVERIFIABLE older open trade: the expiry closure uses the candidate expiry, boundary pinned at 15:30 IST, and is unpriced", async () => {
+    await seedLegacy(OPEN, OPAQUE);
+    setClock("2026-10-06T09:00:00.000Z");
+    let port = await start();
+    const legs = (await call(port, "GET", `/api/paper/trades/${OPEN}`)).body.trade.candidate.legs;
+    setClock("2026-10-06T09:59:59.999Z"); // 15:29:59.999 IST: the next server read
+    const before = await call(port, "POST", `/api/paper/trades/${OPEN}/safety-check`, {});
+    expect(before.body.decision.action).toBe("NONE");
+    expect(before.body.trade.state).toBe("PAPER_OPEN");
+    setClock(CUTOFF); // 15:30:00.000 IST (inclusive)
+    port = await start();
+    expect((await call(port, "POST", `/api/paper/trades/${OPEN}/monitor`, pricesFor(legs, serverNow()))).status).toBe(409); // expiry gate first
+    const s = await call(port, "POST", `/api/paper/trades/${OPEN}/safety-check`, pricesFor(legs, serverNow()));
+    expect(s.body.decision.action).toBe("EXPIRE");
+    expect(s.body.trade).toMatchObject({ state: "PAPER_EXPIRED", exit: { trigger: "EXPIRY", basis: "NONE", exitPremium: null, valuationStatus: "DATA_INSUFFICIENT" }, realizedPnl: { status: "DATA_INSUFFICIENT" } });
+  });
+
+  it("MISMATCH older open trade (instrument names an EARLIER expiry): monitor refused before; the earlier cutoff applies (boundary pinned)", async () => {
+    const stored = await seedLegacy(OPEN, [{ provider: "manual", id: "NIFTY|2026-10-01|CE|22900" }, { provider: "manual", id: "NIFTY|2026-10-01|PE|22800" }]);
+    setClock("2026-10-01T09:00:00.000Z");
+    let port = await start();
+    const g = await call(port, "GET", `/api/paper/trades/${OPEN}`);
+    expect(g.body.trade.expiryStatus).toMatchObject({ status: "BEFORE_CUTOFF", cutoff: "2026-10-01T15:30:00+05:30", expiryUsed: "2026-10-01", instrumentCheck: "MISMATCH" });
+    expect(g.body.trade.candidate.expiry).toBe("2026-10-06"); // never rewritten
+    const legs = g.body.trade.candidate.legs;
+    expect((await call(port, "POST", `/api/paper/trades/${OPEN}/monitor`, pricesFor(legs, serverNow()))).status).toBe(422);
+    setClock("2026-10-01T09:59:59.999Z"); // 15:29:59.999 IST on the instrument expiry date
+    expect((await call(port, "POST", `/api/paper/trades/${OPEN}/safety-check`, {})).body.decision.action).toBe("NONE");
+    setClock("2026-10-01T10:00:00.000Z");
+    port = await start();
+    const at = await call(port, "GET", `/api/paper/trades/${OPEN}`);
+    expect(at.body.trade.expiryStatus).toMatchObject({ status: "EXPIRED_PENDING_CLOSURE", expiryUsed: "2026-10-01" });
+    expect(await readFile(file, "utf8")).toBe(stored); // reads and refusals never rewrite the journal
+    expect((await call(port, "POST", `/api/paper/trades/${OPEN}/exit`, pricesFor(legs, serverNow()))).status).toBe(409);
+    const s = await call(port, "POST", `/api/paper/trades/${OPEN}/safety-check`, {});
+    expect(s.body.trade).toMatchObject({ state: "PAPER_EXPIRED", exit: { basis: "NONE", exitPremium: null }, realizedPnl: { status: "DATA_INSUFFICIENT" } });
+  });
+
+  it.each([
+    ["an opaque provider", [{ provider: "p", id: "abc" }, { provider: "manual", id: "NIFTY|2026-10-06|PE|22800" }], "UNVERIFIABLE", "2026-10-06"],
+    ["a malformed manual id", [{ provider: "manual", id: "NIFTY|2026-10-06|CE" }, { provider: "manual", id: "NIFTY|2026-10-06|PE|22800" }], "UNVERIFIABLE", "2026-10-06"],
+    ["a LATER instrument expiry (never extends the cutoff)", [{ provider: "manual", id: "NIFTY|2026-12-29|CE|22900" }, { provider: "manual", id: "NIFTY|2026-10-06|PE|22800" }], "MISMATCH", "2026-10-06"],
+    ["a strike mismatch", [{ provider: "manual", id: "NIFTY|2026-10-06|CE|23000" }, { provider: "manual", id: "NIFTY|2026-10-06|PE|22800" }], "MISMATCH", "2026-10-06"],
+    ["an option-type mismatch", [{ provider: "manual", id: "NIFTY|2026-10-06|PE|22900" }, { provider: "manual", id: "NIFTY|2026-10-06|PE|22800" }], "MISMATCH", "2026-10-06"],
+  ])("an OLDER review with %s stays readable but cannot be confirmed (422); nothing changes", async (_n, ids, check, used) => {
+    const stored = await seedLegacy("pt_b91fa26-review", ids as [unknown, unknown]);
+    setClock("2026-10-02T04:30:00.000Z");
+    const port = await start();
+    const g = await call(port, "GET", "/api/paper/trades/pt_b91fa26-review");
+    expect(g.status).toBe(200);
+    expect(g.body.trade.expiryStatus).toMatchObject({ status: "BEFORE_CUTOFF", expiryUsed: used, instrumentCheck: check });
+    const legs = g.body.trade.candidate.legs as Array<{ instrument: unknown }>;
+    const c = await call(port, "POST", "/api/paper/trades/pt_b91fa26-review/confirm", {
+      confirmed: true, quotes: legs.map((l, i) => ({ instrument: l.instrument, bid: i === 0 ? 69 : 50.2, ask: i === 0 ? 69.8 : 50.95, ...depth, asOf: serverNow() })),
+    });
+    expect(c.status).toBe(422);
+    expect(c.body.error).toBe("DATA_INSUFFICIENT");
+    expect(c.body.message).toContain(`(${check})`);
+    expect(await readFile(file, "utf8")).toBe(stored); // refused before anything is written
+    const exp = await call(port, "GET", "/api/paper/export");
+    expect(exp.raw).not.toMatch(/expiryUsed|instrumentCheck|instrumentReasons|priceQuality|expiryStatus/);
   });
 });

@@ -9,4 +9,5 @@ export * from "./safety.js";
 export * from "./time.js";
 export * from "./quoteValidation.js";
 export * from "./priceQuality.js";
+export * from "./instrumentIdentity.js";
 export * from "./service.js";

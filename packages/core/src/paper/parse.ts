@@ -11,6 +11,7 @@ import type {
   SafetyCheckRequestDTO,
 } from "../contracts/index.js";
 import { MARKET_IDS, PAPER_SOURCES, PAPER_STRUCTURES } from "../contracts/index.js";
+import { instrumentIdentityProblems } from "./instrumentIdentity.js";
 import { isStrictTimestamp } from "./time.js";
 
 // Strict parsing of untyped JSON. Anything malformed is an error: nothing is silently repaired or defaulted
@@ -125,8 +126,21 @@ export function parseCandidateInput(raw: unknown, ctx: { now: string; newId: () 
       if (l["strike"] === undefined || l["strike"] === null) sub.push("strike is required");
       for (const e of sub) errs.push(`${where}.${e}`);
       let instrument: InstrumentRefDTO | null = null;
-      if (l["instrument"] !== undefined && l["instrument"] !== null) instrument = instrumentRef(l["instrument"], `${where}.instrument`, errs);
-      else if ((optionType === "CE" || optionType === "PE") && strike !== null && typeof marketId === "string" && typeof expiry === "string") {
+      if (l["instrument"] !== undefined && l["instrument"] !== null) {
+        instrument = instrumentRef(l["instrument"], `${where}.instrument`, errs);
+        // Final review: an explicit instrument must identify exactly this leg's contract (market, expiry, option type,
+        // strike), because the expiry cutoff and every price are attached to it. An unreadable instrument is always refused;
+        // each structured field is compared only when that field is itself valid (its own error is reported otherwise).
+        if (instrument !== null) {
+          const problems = instrumentIdentityProblems(instrument, {
+            ...(typeof marketId === "string" && (MARKET_IDS as readonly string[]).includes(marketId) ? { marketId } : {}),
+            ...(typeof expiry === "string" && isRealDate(expiry) ? { expiry } : {}),
+            ...(optionType === "CE" || optionType === "PE" ? { optionType } : {}),
+            ...(strike !== null ? { strike } : {}),
+          });
+          for (const p of problems) errs.push(`${where}.instrument: ${p}`);
+        }
+      } else if ((optionType === "CE" || optionType === "PE") && strike !== null && typeof marketId === "string" && typeof expiry === "string") {
         instrument = manualInstrument(marketId, expiry, optionType, strike);
       }
       const quote = parseQuote(l["quote"], where, errs);

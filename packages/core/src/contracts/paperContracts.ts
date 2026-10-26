@@ -417,7 +417,11 @@ export interface SafetyCheckResponseDTO {
 }
 
 // ---- Phase 1B.2: derived response data (computed when read; NEVER stored in the journal or the raw export) ----
-export const PRICE_QUALITY_LEVELS = ["MANUAL_ENTRY_CHECKED", "UNVERIFIED_LEGACY", "SUPERSEDED_RULE", "NO_PRICE"] as const;
+/**
+ * HISTORICAL_SNAPSHOT (final review): an open trade read at or after its contract's cutoff. Its unrealized P&L is a
+ * snapshot recorded earlier; it is NOT a current, executable or exchange-verified valuation, and it is not realized P&L.
+ */
+export const PRICE_QUALITY_LEVELS = ["MANUAL_ENTRY_CHECKED", "UNVERIFIED_LEGACY", "SUPERSEDED_RULE", "NO_PRICE", "HISTORICAL_SNAPSHOT"] as const;
 export type PriceQualityLevel = (typeof PRICE_QUALITY_LEVELS)[number];
 export const PRICE_QUALITY_FLAGS = [
   "LEGACY_ENTRY_SNAPSHOT_V1",
@@ -432,6 +436,8 @@ export const PRICE_QUALITY_FLAGS = [
   "PROVENANCE_INCONSISTENT",
   // M1 (derived when read): an open trade's unrealized P&L is a snapshot from before the cutoff; read at or after it.
   "UNREALIZED_SNAPSHOT_AFTER_CUTOFF",
+  // Final review (derived when read): an older record whose instruments do not verifiably identify its contract.
+  "INSTRUMENT_IDENTITY_UNVERIFIED",
 ] as const;
 export type PriceQualityFlag = (typeof PRICE_QUALITY_FLAGS)[number];
 /**
@@ -448,10 +454,25 @@ export interface PriceQualityDTO {
 export const EXPIRY_STATUSES = ["BEFORE_CUTOFF", "EXPIRED_REVIEW", "EXPIRED_PENDING_CLOSURE", "CLOSED"] as const;
 export type ExpiryStatus = (typeof EXPIRY_STATUSES)[number];
 /** Where a trade stands relative to its contract's provisional paper-safety cutoff, at the time of the response. */
+/**
+ * Final review: whether every leg's instrument identifies the contract in the structured fields (derived, never stored).
+ *  - CONSISTENT: every leg's manual instrument matches market, expiry, option type and strike (always true for
+ *    candidates accepted now).
+ *  - MISMATCH: an older record whose readable instrument differs in market, expiry, option type or strike.
+ *  - UNVERIFIABLE: an older record whose instrument cannot be read (opaque provider or malformed id).
+ * A record that is not CONSISTENT is never confirmed, monitored, exited or priced; it can only be closed unpriced.
+ */
+export const INSTRUMENT_CHECKS = ["CONSISTENT", "MISMATCH", "UNVERIFIABLE"] as const;
+export type InstrumentCheck = (typeof INSTRUMENT_CHECKS)[number];
 export interface ExpiryStatusDTO {
   status: ExpiryStatus;
-  /** 15:30 Asia/Kolkata on the expiry date, e.g. 2026-10-06T15:30:00+05:30. */
+  /** 15:30 Asia/Kolkata on the expiry date used (expiryUsed), e.g. 2026-10-06T15:30:00+05:30. */
   cutoff: string;
+  /** The expiry date the safety rules use: the candidate expiry, or an earlier instrument expiry on an older record. */
+  expiryUsed: string;
+  instrumentCheck: InstrumentCheck;
+  /** Why the record is not CONSISTENT (empty when it is). */
+  instrumentReasons: string[];
 }
 /** A trade as the API returns it: the stored record plus derived fields. The journal only ever stores the record. */
 export type PaperTradeView = PaperTradeRecord & { priceQuality: PriceQualityDTO; expiryStatus: ExpiryStatusDTO };

@@ -201,23 +201,56 @@ describe("M1: an unrealized P&L read after the cutoff is shown as a historical s
       lastMonitor: { asOf: T, legs: [], dataStatus: "VALID", dataReasons: [], currentExitPremium: 120.05, unrealized: pnl, currentRisk: risk("LOW"), carriedFromEntry: [] },
     }), { priceQuality: pq, expiryStatus: { status, cutoff: "2026-10-06T15:30:00+05:30" } });
 
-  it("with the server's UNREALIZED_SNAPSHOT_AFTER_CUTOFF flag: labelled historical, 'at that time', and the list says so", async () => {
+  it("HISTORICAL_SNAPSHOT from the server: labelled historical (not current or executable, not exchange-verified, not realized), and the list says so", async () => {
     await show(monitored({
-      level: "NO_PRICE",
+      level: "HISTORICAL_SNAPSHOT",
       flags: ["UNREALIZED_SNAPSHOT_AFTER_CUTOFF"],
       warnings: ["The contract has reached its provisional 15:30 IST paper-safety cutoff. The unrealized P&L shown is a historical snapshot, not a current or executable valuation."],
       note: `There is no current price: … recorded by the server at ${T} …`,
     }, "EXPIRED_PENDING_CLOSURE"));
-    expect(await screen.findByText(/Unrealized P&L \(historical snapshot from before the expiry cutoff; not a current or executable valuation\)/)).toBeInTheDocument();
-    expect(screen.getByText(/Exit premium at that time/)).toBeInTheDocument();
+    expect(await screen.findByText(/Unrealized P&L \(historical snapshot recorded before the expiry cutoff; not a current or executable price, not exchange-verified, not realized P&L\)/)).toBeInTheDocument();
+    expect(screen.getByText(/Exit premium when recorded/)).toBeInTheDocument();
     expect(screen.queryByText(/Exit premium now/)).toBeNull();
-    expect(screen.getByText(/historical snapshot \(before expiry cutoff\); not a current valuation/)).toBeInTheDocument();
-    expect(document.querySelector('[data-price-quality="NO_PRICE"]')).not.toBeNull();
+    expect(screen.getByText(/historical snapshot \(before expiry cutoff\); not a current price, not exchange-verified/)).toBeInTheDocument();
+    expect(document.querySelector('[data-price-quality="HISTORICAL_SNAPSHOT"]')).not.toBeNull();
+    expect(screen.queryByText(/Realized P&L/)).toBeNull(); // never shown as realized
   });
 
-  it("without the flag (before the cutoff) the existing wording is unchanged", async () => {
+  it("before the cutoff: no historical label, and (final review, item 3) no 'now' freshness claim for a recorded snapshot", async () => {
     await show(monitored({ level: "MANUAL_ENTRY_CHECKED", flags: [], warnings: [], note: "Valued from prices entered manually." }, "BEFORE_CUTOFF"));
-    expect(await screen.findByText(/Exit premium now/)).toBeInTheDocument();
+    expect(await screen.findByText(/Exit premium when recorded .*not refreshed since/)).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(`Recorded by the server at ${T}`))).toBeInTheDocument();
+    expect(screen.queryByText(/Exit premium now/)).toBeNull();
     expect(screen.queryByText(/historical snapshot/)).toBeNull();
+  });
+});
+
+describe("final review: an older record whose instruments do not verifiably identify its contract", () => {
+  const status = (check: string, used: string, reasons: string[], s = "BEFORE_CUTOFF") => ({ status: s, cutoff: `${used}T15:30:00+05:30`, expiryUsed: used, instrumentCheck: check, instrumentReasons: reasons });
+  it.each([
+    ["MISMATCH", "2026-10-01", ["CE 22900: instrument expiry \"2026-10-01\" does not match the expiry \"2026-10-06\" (neither is rewritten)"], /instrument check MISMATCH\)\. The expiry cutoff uses the earliest date named, 2026-10-01\./],
+    ["UNVERIFIABLE", "2026-10-06", ["CE 22900: a \"p\" instrument cannot be verified"], /instrument check UNVERIFIABLE\)\. The expiry cutoff uses the candidate expiry, 2026-10-06, which is NOT verified\./],
+  ])("an open %s record: notice and reasons shown; monitor and exit forms hidden; the safety check stays", async (check, used, reasons, text) => {
+    await show(withView(makeTrade("PAPER_OPEN"), { expiryStatus: status(check, used, reasons) }));
+    expect(await screen.findByText(text)).toBeInTheDocument();
+    expect(screen.getByText(reasons[0] as string)).toBeInTheDocument();
+    expect(document.querySelector(`[data-instrument-check="${check}"]`)).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Record monitor update" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Exit paper trade" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Run safety check" })).toBeInTheDocument();
+  });
+  it("a review that is not CONSISTENT shows no confirm form", async () => {
+    await show(withView(makeTrade("PAPER_REVIEW"), { expiryStatus: status("UNVERIFIABLE", "2026-10-06", ["CE 22900: a \"p\" instrument cannot be verified"]) }));
+    expect(await screen.findByText(/cannot be confirmed, monitored or exited/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Confirm paper trade" })).toBeNull();
+  });
+  it("a consistent record shows no instrument notice and keeps its forms", async () => {
+    await show(withView(makeTrade("PAPER_OPEN"), { expiryStatus: status("CONSISTENT", "2026-10-06", []) }));
+    expect(await screen.findByRole("button", { name: "Record monitor update" })).toBeInTheDocument();
+    expect(document.querySelector("[data-instrument-check]")).toBeNull();
+  });
+  it("an expired open trade on an older MISMATCH record names the earlier expiry in the closure notice", async () => {
+    await show(withView(makeTrade("PAPER_OPEN"), { expiryStatus: status("MISMATCH", "2026-10-01", ["x"], "EXPIRED_PENDING_CLOSURE") }));
+    expect(await screen.findByText(/Contract expired at 15:30 IST on 2026-10-01/)).toBeInTheDocument();
   });
 });

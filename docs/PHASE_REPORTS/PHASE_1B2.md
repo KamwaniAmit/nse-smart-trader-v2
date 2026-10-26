@@ -16,6 +16,9 @@ Decided item 5), plus two later review corrections:
 - **Safety-review correction:** at or after the cutoff the server clock alone decides; an unacceptable or malformed client `asOf`, or a
   quote for another instrument, cannot block the required unpriced expiry closure (it is ignored and noted, never used).
 - **M1 (review of PR #1):** an open trade read at or after its cutoff no longer shows its old unrealized P&L as a checked valuation.
+- **Final review:** explicit leg instruments must match market, expiry, option type and strike exactly; older records that are not consistent
+  stay readable but are never priced again (closed unpriced only); the post-cutoff snapshot has its own derived level `HISTORICAL_SNAPSHOT`;
+  the stale-age warning before the cutoff is explicitly deferred.
 
 ## Phase 1B.1 fixes included in this pull request
 
@@ -40,23 +43,24 @@ Details: `PHASE_REPORTS/PHASE_1B1.md`.
 | Bad monitor price (A8) | Recorded as a `DATA_INSUFFICIENT` snapshot; it never replaces the last valid bids. | |
 | Holding limit (A5) | Priced only from checked manual prices before the cutoff; otherwise unpriced. | The completed-session count is typed by the user; there is no trading calendar. |
 | Price quality and expiry status (A10, D2 to D4, D8) | Every trade-returning response carries derived `priceQuality` (level, flags, warnings, note) and `expiryStatus`. They are computed when read and never stored. | Ambiguous older records are never upgraded. |
-| M1 historical snapshot | An open trade read at or after its cutoff: unrealized P&L flagged `UNREALIZED_SNAPSHOT_AFTER_CUTOFF`, level `NO_PRICE`, and the UI labels it "historical snapshot ... not a current or executable valuation". Decided by the server read time and the approved cutoff only. | **Before the cutoff, an old snapshot is not flagged by age**: no stale-age threshold has been approved. The UI shows when the server recorded it. |
+| Historical snapshot (M1, final review) | An open trade read at or after its cutoff with a recorded valid unrealized P&L: level `HISTORICAL_SNAPSHOT`, flag `UNREALIZED_SNAPSHOT_AFTER_CUTOFF`; the UI labels it "historical snapshot ... not a current or executable price, not exchange-verified, not realized P&L". Without a recorded valid figure the level stays `NO_PRICE`. Decided by the server read time and the approved cutoff only; display-only. | **Before the cutoff, an old snapshot is not flagged by age** (deferred: no approved threshold; stored times show when an update was recorded, not when prices were observed). The UI shows the recording time and never says "now". |
+| Instrument identity (final review) | An explicit leg instrument must be `{ provider: "manual", id: "<market>\|<YYYY-MM-DD>\|<CE or PE>\|<strike>" }` with every part equal to the structured fields (strike as `String(strike)`); anything else is refused (`INVALID_REQUEST`, 400). Older records are not rewritten: `expiryStatus` reports `instrumentCheck`, `instrumentReasons` and `expiryUsed` (earliest readable expiry). A record that is not `CONSISTENT` cannot be confirmed, monitored or exited (`DATA_INSUFFICIENT`, 422, nothing written); it is closed only unpriced (holding limit or expiry) and its price quality is flagged `INSTRUMENT_IDENTITY_UNVERIFIED`. | Exact-text comparison: a strike written another way (`22900.0`) is refused. An `UNVERIFIABLE` older open trade's true expiry is unknown; it uses the candidate expiry for the cutoff, shown as not verified, and nothing is priced meanwhile. |
 | Raw journal export | Unchanged: stored records only, without derived fields. No enriched export exists. | |
 | Legacy label | Priced exits keep `basis: "CURRENT_QUOTE"` (legacy label, schema unchanged); the method is identified by `valuationStatus` and `priceProvenance`. | |
 
 ## Validation (actual results)
 
-Run on commit candidate = `6efbeeb` plus the M1 / report change, in a clean checkout (Linux, Node 22.22.2, npm 10.9.4), by the AI assistant:
+Run on `6f1fd0b` plus the final-review change, in a clean checkout (Linux, Node 22.22.2, npm 10.9.4), by the AI assistant:
 
 | Command | Exit | Result |
 |---|---|---|
 | `npm ci --ignore-scripts` | 0 | `package-lock.json` unchanged |
-| `npm run check` (typecheck, lint, tests) | 0 | **754 / 754** tests passed, **26 / 26** test files |
+| `npm run check` (typecheck, lint, tests) | 0 | **813 / 813** tests passed, **26 / 26** test files |
 | `npm run build` | 0 | core, adapters, api, web |
 | `git diff --check` | 0 | clean |
 
-The owner reported the equivalent Windows results for `6efbeeb` (742 / 742, build OK, `git diff --check` clean) and should re-run
-`npm.cmd run check`, `npm.cmd run build` and `git diff --check` after applying this change.
+The owner reported Windows results for `6efbeeb` (742 / 742) and `6f1fd0b` (754 / 754), each with the build OK and `git diff --check`
+clean, and should re-run `npm.cmd run check`, `npm.cmd run build` and `git diff --check` after applying the final-review change.
 
 **GitHub CI has not run.** The repository has no workflow under `.github/workflows`, and PR #1 shows 0 checks. All results above are local.
 
@@ -64,25 +68,31 @@ The owner reported the equivalent Windows results for `6efbeeb` (742 / 742, buil
 
 | | Phase 1B.1 (`b91fa26`) | Phase 1B.2 (this branch) |
 |---|---|---|
-| Tests | 573 (23 files) | **754** (26 files) |
+| Tests | 573 (23 files) | **813** (26 files) |
 
-- 568 of the 573 Phase 1B.1 test names are unchanged. Some of them had approved minimal input changes (for example the six approved test
+- 567 of the 573 Phase 1B.1 test names are unchanged. Some of them had approved minimal input changes (for example the six approved test
   corrections: an ask and an entry time added to bid-only exit quotes, a later fixture expiry for the 10-day stale-quote case, the
   `MANUAL_ENTRY_CHECKED` expectation, and the derived fields excluded from a stored-record comparison).
 - **5 tests in `phase1b1Fixes.test.ts` were rewritten one for one** because the approved behaviour changed: expiry closures are no longer
   priced from typed bids (A4), and expiry is at 15:30 IST on the expiry date instead of 00:00 IST the next day (A3).
-- **181 tests are new:** `packages/core/tests/phase1b2Safety.test.ts` 152, `apps/web/tests/phase1b2.test.tsx` 16,
-  `apps/api/tests/phase1b2Api.test.ts` 13. Of these, 17 cover the safety-review correction and 12 cover M1 (10 core, 2 web).
-- 754 = 568 unchanged names + 5 rewritten + 181 new.
+- **1 test in `paperParse.test.ts` was rewritten** (final review): "keeps a supplied instrument identity exactly" used an opaque instrument
+  (`{ provider: "p", id: "abc" }`) whose expiry cannot be verified, which is now refused. It now keeps a consistent manual instrument exactly;
+  the opaque case has its own refusal test.
+- **240 tests are new:** `packages/core/tests/phase1b2Safety.test.ts` 170, `apps/api/tests/phase1b2Api.test.ts` 27,
+  `apps/web/tests/phase1b2.test.tsx` 21, `packages/core/tests/paperParse.test.ts` 22.
+- 813 = 567 unchanged names + 6 rewritten + 240 new.
+- Final review against `6f1fd0b` (754): 746 names unchanged, 8 renamed because their expectation changed intentionally (5 core and 2 web M1
+  tests now expect `HISTORICAL_SNAPSHOT` / the "when recorded" wording; 1 parse test above), 59 new.
 - The Phase 1A test files are unchanged against `main`.
 - `packages/core/src/paper/pricing.ts` (LONG VOL formulas) and `package-lock.json` are unchanged against `main`.
 
 ## Known limitations
 
 - The 15:30 IST cutoff is provisional (see above). Holidays, special sessions and changed hours are not handled.
-- **Instrument / expiry consistency is not checked.** A candidate leg may carry an explicit instrument whose identifier names a different
-  expiry from the candidate's `expiry`; the cutoff follows the candidate's `expiry` (inherited from Phase 1B; unfixed).
-- No stale-age warning for unrealized P&L before the cutoff (no approved threshold).
+- Instrument identity is compared by exact text with the parser's own builder; no other notation of a strike is accepted.
+- An older `UNVERIFIABLE` open trade's true expiry is unknown. It uses the candidate expiry for the cutoff (shown as not verified); until then it
+  can only be closed unpriced by a holding-limit safety check, and it cannot be monitored or exited.
+- **No stale-age warning for unrealized P&L before the cutoff: deferred** (no approved threshold; no evidence of when prices were observed).
 - Expiry closures are unpriced while no approved settlement-price source exists.
 - Session counts and trading days to expiry are user-supplied (no trading calendar).
 - Single-user, local only; no authentication. The file journal is not guaranteed durable storage (see `PAPER_TRADING.md`).

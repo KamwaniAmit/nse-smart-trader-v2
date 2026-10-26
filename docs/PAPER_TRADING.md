@@ -33,6 +33,25 @@ There is no broker yet, so a candidate is **typed in** on the LONG VOL or Best O
 does not calculate them, so the frozen LONG VOL mathematics is untouched. Instrument identity for a typed leg is
 `{ provider: "manual", id: "<market>|<expiry>|<CE or PE>|<strike>" }`. It is **not** broker-verified.
 
+**Instrument identity (Phase 1B.2 final review).** A leg may carry an explicit instrument only if it identifies exactly that leg's contract,
+because the expiry cutoff and every price are attached to it. It must use the manual format above, and each part must equal what the parser's
+own builder writes from the structured fields: market = `marketId`, expiry = `expiry` (a real `YYYY-MM-DD` date), option type = the leg's
+`optionType`, strike = the leg's `strike` as written by `String(strike)` (no other normalisation: `22900.0` is not `22900`). A mismatch in any
+part, a missing or malformed part, or an opaque instrument of another provider (none of whose fields can be verified) is refused with
+`INVALID_REQUEST` (HTTP 400). Nothing is rewritten.
+
+Older stored records are never rewritten and stay readable. The response's `expiryStatus` reports `instrumentCheck` (`CONSISTENT`, `MISMATCH`,
+`UNVERIFIABLE`), `instrumentReasons` and `expiryUsed` (the earliest readable expiry, so an inconsistent instrument can never move the cutoff later;
+for `UNVERIFIABLE` it is the candidate expiry, shown as not verified). A record that is not `CONSISTENT` is never priced again:
+
+| Action on a record that is not `CONSISTENT` | Rule |
+|---|---|
+| Confirm (review) | refused, `DATA_INSUFFICIENT` (422); nothing written |
+| Monitor, exit | refused, `DATA_INSUFFICIENT` (422); nothing written (at or after the cutoff `CONTRACT_EXPIRED` comes first) |
+| Holding-limit closure (safety check) | allowed, always **unpriced** (basis `NONE`, P&L `DATA_INSUFFICIENT`); supplied prices are not used |
+| Expiry closure (safety check) | allowed at the cutoff of `expiryUsed`, unpriced as for every expiry closure |
+| Price quality | flagged `INSTRUMENT_IDENTITY_UNVERIFIED`; never `MANUAL_ENTRY_CHECKED` |
+
 - LONG VOL: `STRADDLE` (CE and PE at the same strike) or `STRANGLE` (CE strike above PE strike). Two legs, same expiry and lot size.
 - Best Opportunities: `SINGLE_CALL` (one CE) or `SINGLE_PUT` (one PE).
 - The same lifecycle, journal and rules apply to both.
@@ -151,12 +170,17 @@ stored record each time it is read and are **never written to the journal** (A10
   - `UNVERIFIED_LEGACY`: the P&L comes from prices the current rules did not check (older records), or the record's provenance is incomplete
     (`PROVENANCE_INCOMPLETE`) or does not satisfy the rules (`PROVENANCE_INCONSISTENT`). Ambiguous records are never upgraded.
   - `SUPERSEDED_RULE`: the P&L was produced by a rule that is no longer allowed (an earlier monitored bid, bids typed at expiry, or an action at or after the cutoff).
-  - `NO_PRICE`: there is no valid P&L, **or** (M1) the trade is still open and is read at or after its contract's cutoff. Then the
-    unrealized P&L is flagged `UNREALIZED_SNAPSHOT_AFTER_CUTOFF`: it is a historical snapshot recorded by the server before the cutoff,
-    not a current or executable valuation, and the UI labels it that way. This is decided by the **server** read time and the approved
-    15:30 IST cutoff only (never a client time). No age limit is applied before the cutoff: no stale-age threshold has been approved.
-- `expiryStatus`: `{ status, cutoff }`, where status is `BEFORE_CUTOFF`, `EXPIRED_REVIEW` (a review that can no longer be confirmed; it stays `PAPER_REVIEW`, A7),
-  `EXPIRED_PENDING_CLOSURE` (open past the cutoff; run the safety check) or `CLOSED`.
+  - `NO_PRICE`: there is no valid P&L (none was recorded, or the recorded one is `DATA_INSUFFICIENT`).
+  - `HISTORICAL_SNAPSHOT` (final review; replaces the M1 use of `NO_PRICE`): the trade is still open, has a recorded valid unrealized P&L,
+    and is read at or after its contract's cutoff. The figure is flagged `UNREALIZED_SNAPSHOT_AFTER_CUTOFF`: a historical snapshot recorded by
+    the server before the cutoff. It is not a current or executable valuation, not exchange-verified and not realized P&L, and the UI labels it
+    that way. Decided by the **server** read time and the approved 15:30 IST cutoff only (never a client time). It is display-only: the expiry
+    closure, realized P&L and lifecycle are unchanged.
+  - **No stale-age warning before the cutoff** (deliberately deferred): the server time of a monitor update says when it was recorded, not when
+    the user observed the prices, and no age threshold has been approved. The UI shows the recording time and says "Exit premium when
+    recorded … not refreshed since"; it never says "now".
+- `expiryStatus`: `{ status, cutoff, expiryUsed, instrumentCheck, instrumentReasons }`, where status is `BEFORE_CUTOFF`, `EXPIRED_REVIEW` (a review that can no
+  longer be confirmed; it stays `PAPER_REVIEW`, A7), `EXPIRED_PENDING_CLOSURE` (open past the cutoff; run the safety check) or `CLOSED`.
 
 **The raw journal export (`GET /export`) is unchanged**: it contains the stored records only, without these derived fields. No enriched export exists.
 
