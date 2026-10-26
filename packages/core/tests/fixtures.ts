@@ -46,15 +46,66 @@ export const exitQuotes = (ceBid: number | null = 66.05, peBid: number | null = 
   ...extra,
 });
 
-/** A service with an in-memory journal, a ticking clock and predictable ids. No broker, no disk, no network. */
-export function makeService() {
-  let tick = 0;
+/**
+ * Phase 1B.2 (A2): monitor, exit and holding-limit prices carry their own MANUAL-ENTRY time. This stamps every quote in a
+ * request body with the time passed IN BY THE TEST (normally `svc.clock.peek()`, the time the service will read next, so
+ * the age is 0). There is no hidden or shared clock: the caller always says which time it means.
+ */
+export function atEntryTime<T extends { quotes: Array<Record<string, unknown>> }>(body: T, enteredAt: string): T {
+  return { ...body, quotes: body.quotes.map((q) => ({ ...q, asOf: enteredAt })) };
+}
+
+/** The fixture clock starts here. Each call to the service clock returns the current time and then moves it 1s on. */
+export const T0 = "2026-09-28T10:00:00Z";
+const iso = (ms: number): string => new Date(ms).toISOString().replace(".000Z", "Z");
+
+/**
+ * A service with an in-memory journal, an INJECTED clock (Phase 1B.1, D3) and predictable ids.
+ * No broker, no disk, no network. `clock` lets a test read the time without moving it, or move it on.
+ */
+export function makeService(start: string = T0) {
+  let ms = Date.parse(start);
   let id = 0;
-  const now = () => `2026-09-28T10:${String(Math.floor(tick / 60)).padStart(2, "0")}:${String(tick++ % 60).padStart(2, "0")}Z`;
+  const now = () => {
+    const s = iso(ms);
+    ms += 1000;
+    return s;
+  };
+  const clock = {
+    peek: (): string => iso(ms),
+    set: (to: string): void => {
+      ms = Date.parse(to);
+    },
+    advance: (deltaMs: number): void => {
+      ms += deltaMs;
+    },
+  };
   const repository = new InMemoryJournalRepository(now);
   const service = createPaperTradingService({ repository, now, newId: () => `${++id}` });
-  return { service, repository };
+  return { service, repository, clock };
 }
+
+type RawLeg = { optionType: "CE" | "PE"; strike: number; instrument?: { provider: string; id: string }; quote: Record<string, unknown> };
+
+/**
+ * Fresh entry quotes for the EXACT legs of a candidate (Phase 1B.1, D1). By default they repeat the candidate's own
+ * prices, so the established numbers (entry 120.75) still hold, and they are stamped with the current clock time.
+ */
+export function freshQuotes(raw: Record<string, unknown> = longVolRaw(), asOf?: string, override: Record<string, unknown> = {}) {
+  const legs = raw["legs"] as RawLeg[];
+  return legs.map((l) => ({
+    instrument: l.instrument ?? { provider: "manual", id: `${String(raw["marketId"])}|${String(raw["expiry"])}|${l.optionType}|${l.strike}` },
+    ...l.quote,
+    ...(asOf === undefined ? {} : { asOf }),
+    ...override,
+  }));
+}
+
+/** A valid confirmation body: confirmed: true plus fresh quotes stamped with the service clock's current time. */
+export const confirmBody = (svc: ReturnType<typeof makeService>, raw: Record<string, unknown> = longVolRaw()) => ({
+  confirmed: true,
+  quotes: freshQuotes(raw, svc.clock.peek()),
+});
 
 /** Review a candidate and return its id (throws if it did not succeed). */
 export async function reviewed(svc: ReturnType<typeof makeService>, raw: Record<string, unknown> = longVolRaw()): Promise<string> {
@@ -66,7 +117,7 @@ export async function reviewed(svc: ReturnType<typeof makeService>, raw: Record<
 /** Review and explicitly confirm. */
 export async function opened(svc: ReturnType<typeof makeService>, raw: Record<string, unknown> = longVolRaw()): Promise<string> {
   const id = await reviewed(svc, raw);
-  const c = await svc.service.confirm(id, { confirmed: true });
+  const c = await svc.service.confirm(id, confirmBody(svc, raw));
   if (!c.ok) throw new Error(`confirm failed: ${JSON.stringify(c.error)}`);
   return id;
 }

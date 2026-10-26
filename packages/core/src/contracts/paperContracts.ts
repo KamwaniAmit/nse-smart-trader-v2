@@ -85,25 +85,39 @@ export interface LegQuoteDTO {
   oi?: number | null;
 }
 
+/**
+ * Phase 1B.1 (D1): an entry quote also carries the time it was observed. The server checks that time against its own
+ * clock; it is never trusted on its own. For MANUAL data it is the time the user entered the prices.
+ */
+export interface EntryQuoteDTO extends LegQuoteDTO {
+  asOf?: string;
+}
+
 export interface ConfirmRequestDTO {
   confirmed: boolean;
+  /** Fresh executable quotes for EVERY leg (exact instruments). Required when confirmed is true (Phase 1B.1, D1). */
+  quotes?: EntryQuoteDTO[];
 }
+// Phase 1B.2 (A2): monitor, exit and safety prices are typed by the user, so each quote also carries its own
+// MANUAL-ENTRY time (asOf, the moment the price was typed). The server checks it against its clock; it is never treated
+// as an exchange timestamp.
 export interface MonitorRequestDTO {
   asOf?: string;
-  quotes: LegQuoteDTO[];
+  quotes: EntryQuoteDTO[];
   tradingDaysToExpiry?: number | null;
   spot?: number | null;
   exitCosts?: number | null;
 }
 export interface ExitRequestDTO {
   asOf?: string;
-  quotes: LegQuoteDTO[];
+  quotes: EntryQuoteDTO[];
   exitCosts?: number | null;
 }
 export interface SafetyCheckRequestDTO {
-  asOf: string;
+  /** Optional and untrusted (Phase 1B.1, D3): validated and recorded, but expiry and safety are decided on SERVER time. */
+  asOf?: string;
   completedSessions?: number | null;
-  quotes?: LegQuoteDTO[];
+  quotes?: EntryQuoteDTO[];
   exitCosts?: number | null;
 }
 
@@ -193,11 +207,15 @@ export interface PaperEntryLeg {
   readonly instrument: InstrumentRefDTO;
   readonly entryAsk: number;
   readonly entryBid: number | null;
+  /** Phase 1B.1 (D1): when this leg's entry quote was observed, and how old it was at confirmation. Absent on v1 snapshots. */
+  readonly quoteAsOf?: string;
+  readonly quoteAgeMs?: number;
 }
 
 /** Recorded once, at confirmation. Frozen in memory and never changed afterwards. */
 export interface PaperEntrySnapshot {
-  readonly snapshotVersion: 1;
+  /** 1 = Phase 1B (priced from review-time quotes). 2 = Phase 1B.1 (priced from fresh, time-checked quotes). */
+  readonly snapshotVersion: 1 | 2;
   readonly capturedAt: string;
   readonly candidateId: string;
   readonly source: PaperSource;
@@ -218,37 +236,108 @@ export interface PaperEntrySnapshot {
   readonly capital: CapitalAssessment;
   readonly capitalRequirement: number | null;
   readonly dataCompleteness: { readonly complete: boolean; readonly missing: readonly string[] };
+  /** Phase 1B.1 (D1): the freshness rule applied at confirmation. Absent on v1 snapshots. */
+  readonly quoteFreshness?: { readonly maxQuoteAgeMs: number; readonly maxFutureSkewMs: number; readonly evaluatedAt: string };
+  /** Phase 1B.1 (D1): when the candidate (spot, moves, edge, score) was supplied. These are NOT re-priced at confirmation. */
+  readonly candidateAsOf?: string;
 }
 
+/**
+ * "LAST_VALID_MONITOR_BID" exists only in records written by Phase 1B (1d21f06). Since Phase 1B.1 (D2) it is never
+ * produced: an old bid is not an executable exit price. It stays in the type so older journals still load.
+ *
+ * "CURRENT_QUOTE" is a LEGACY basis label, kept unchanged so the journal and export schema do not change. It only says
+ * the exit was valued from prices supplied in the same request. For Phase 1B.2 records the actual valuation method is
+ * identified by `valuationStatus: "MANUAL_ENTRY_CHECKED"` together with `priceProvenance: "MANUAL_USER_ENTRY"`:
+ * prices typed by the user that passed the manual-input checks - never exchange-sourced or exchange-verified.
+ */
 export type ExitBasis = "CURRENT_QUOTE" | "LAST_VALID_MONITOR_BID" | "NONE";
+/**
+ * How the exit was valued.
+ *  - MANUAL_ENTRY_CHECKED (Phase 1B.2, A9): valued from prices the user typed, and the application's manual-input
+ *    validation rules passed (bid and ask valid, not crossed, entered within the approved time limit, exact legs, no
+ *    conflicting duplicates). It does NOT mean exchange-sourced, exchange-timestamped or independently verified.
+ *  - EXECUTABLE_QUOTE: written by Phase 1B.1 only (bid checked, ask and price age not checked). Never written since 1B.2.
+ *  - DATA_INSUFFICIENT: no valuation; P&L is DATA_INSUFFICIENT.
+ */
+export type ExitValuationStatus = "MANUAL_ENTRY_CHECKED" | "EXECUTABLE_QUOTE" | "DATA_INSUFFICIENT";
+/** Where the prices behind a valuation came from (Phase 1B.2). There is no exchange source in this application. */
+export type PriceProvenance = "MANUAL_USER_ENTRY" | "NONE";
+/** The rule values applied when a manual valuation was checked (Phase 1B.2), recorded with the valuation. */
+export interface ValuationRuleRecord {
+  maxManualPriceAgeMs: number;
+  maxFutureSkewMs: number;
+  /** The contract's provisional paper-safety cutoff (15:30 Asia/Kolkata on the expiry date). */
+  expiryCutoff: string;
+  /** Server time at which the check was made. */
+  evaluatedAt: string;
+}
+/** One leg's exit price. ask / enteredAt / entryAgeMs exist only on records written since Phase 1B.2. */
+export interface ExitLegPrice {
+  instrument: InstrumentRefDTO;
+  bid: number | null;
+  ask?: number | null;
+  /** When the user TYPED this leg's prices (user-entry time, not an exchange time). */
+  enteredAt?: string;
+  /** Server time minus enteredAt, in ms, when the price was checked. */
+  entryAgeMs?: number;
+}
 export type ExitTrigger = "USER_EXIT" | "EXPIRY" | "HOLDING_LIMIT";
 
 export interface PaperExitRecord {
+  /** Server processing time of the exit / closure event (authoritative). Not a quote-observation time. */
   timestamp: string;
   trigger: ExitTrigger;
   basis: ExitBasis;
+  /**
+   * When the exit quote was OBSERVED, if a trustworthy observation time exists. Review correction R4: monitor, exit and
+   * safety quotes carry no observation time, so new records store null ("unavailable"); the server processing time is in
+   * `timestamp`. Records written before R4 may hold a server or client time here; it is not a verified observation time.
+   */
   priceAsOf: string | null;
-  legBids: Array<{ instrument: InstrumentRefDTO; bid: number | null }>;
+  legBids: ExitLegPrice[];
   exitPremium: number | null;
   exitCosts: number | null;
   notes: string[];
+  /** Phase 1B.1 (D2). Absent on records written by Phase 1B. */
+  valuationStatus?: ExitValuationStatus;
+  /** Phase 1B.1 (D2): the last valid monitored bids, kept for HISTORICAL REFERENCE ONLY. Never used for P&L. */
+  staleReference?: LastValidExit | null;
+  /** Review correction R2: the validated client-supplied asOf, as metadata only. `timestamp` is always server time. */
+  clientAsOf?: string;
+  /** Phase 1B.2: where the valuation prices came from. Absent on older records. */
+  priceProvenance?: PriceProvenance;
+  /** Phase 1B.2: the rule values applied to the manual prices. Absent on older records. */
+  valuationRule?: ValuationRuleRecord;
+  /** Phase 1B.2 (A5): a holding-limit closure's completed-session count was typed by the user (no trading calendar). */
+  sessionsSource?: "USER_PROVIDED";
 }
 
 export interface PaperMonitorSnapshot {
+  /** Server time this monitor update was recorded (processing time). Not a quote-observation time (R4). */
   asOf: string;
-  legs: Array<{ instrument: InstrumentRefDTO; bid: number | null; ask: number | null; bidValid: boolean }>;
+  legs: Array<{ instrument: InstrumentRefDTO; bid: number | null; ask: number | null; bidValid: boolean; enteredAt?: string; entryAgeMs?: number }>;
   dataStatus: "VALID" | "DATA_INSUFFICIENT";
   dataReasons: string[];
   currentExitPremium: number | null;
   unrealized: PaperPnl;
   currentRisk: RiskAssessmentRecord;
   carriedFromEntry: string[];
+  /** Review correction R2: the validated client-supplied asOf, as metadata only. `asOf` is always server time. */
+  clientAsOf?: string;
+  /** Phase 1B.2: the prices were typed by the user. Absent on older records. */
+  priceProvenance?: PriceProvenance;
+  /** Phase 1B.2: the rule values applied to the manual prices. Absent on older records. */
+  valuationRule?: ValuationRuleRecord;
 }
 
 export interface LastValidExit {
+  /** Server time the monitor update holding these bids was recorded (processing time). Not a quote-observation time (R4). */
   asOf: string;
-  legBids: Array<{ instrument: InstrumentRefDTO; bid: number }>;
+  legBids: Array<{ instrument: InstrumentRefDTO; bid: number; enteredAt?: string }>;
   exitPremium: number;
+  /** Phase 1B.2: the prices were typed by the user. Absent on older records. */
+  priceProvenance?: PriceProvenance;
 }
 
 export interface PaperTradeRecord {
@@ -276,6 +365,10 @@ export const PAPER_JOURNAL_EVENT_TYPES = [
   "TRADE_OPENED",
   "MONITOR_SNAPSHOT",
   "EXIT_REJECTED_DATA_INSUFFICIENT",
+  "CONFIRM_REJECTED_QUOTE",
+  "CONFIRM_REJECTED_EXPIRED", // Phase 1B.2: confirmation refused at or after the contract's cutoff
+  "EXIT_REJECTED_EXPIRED", // Phase 1B.2: exit refused at or after the contract's cutoff
+  "EXIT_REJECTED_QUOTE", // Phase 1B.2: exit refused because a manual price's entry time failed the time rules
   "TRADE_EXITED",
   "TRADE_EXPIRED",
   "TRADE_AUTO_CLOSED",
@@ -320,8 +413,69 @@ export interface SafetyDecisionDTO {
 
 export interface SafetyCheckResponseDTO {
   decision: SafetyDecisionDTO;
-  trade: PaperTradeRecord;
+  trade: PaperTradeView;
 }
+
+// ---- Phase 1B.2: derived response data (computed when read; NEVER stored in the journal or the raw export) ----
+/**
+ * HISTORICAL_SNAPSHOT (final review): an open trade read at or after its contract's cutoff. Its unrealized P&L is a
+ * snapshot recorded earlier; it is NOT a current, executable or exchange-verified valuation, and it is not realized P&L.
+ */
+export const PRICE_QUALITY_LEVELS = ["MANUAL_ENTRY_CHECKED", "UNVERIFIED_LEGACY", "SUPERSEDED_RULE", "NO_PRICE", "HISTORICAL_SNAPSHOT"] as const;
+export type PriceQualityLevel = (typeof PRICE_QUALITY_LEVELS)[number];
+export const PRICE_QUALITY_FLAGS = [
+  "LEGACY_ENTRY_SNAPSHOT_V1",
+  "UNREALIZED_FROM_UNCHECKED_MONITOR",
+  "ASK_AND_PRICE_AGE_NOT_CHECKED",
+  "UNVERIFIED_PRICE_TIME",
+  "PRICED_FROM_EARLIER_MONITOR_BID",
+  "EXPIRY_PRICED_FROM_TYPED_BIDS",
+  "SESSION_COUNT_USER_PROVIDED",
+  "ACTION_AFTER_EXPIRY_CUTOFF",
+  "PROVENANCE_INCOMPLETE",
+  "PROVENANCE_INCONSISTENT",
+  // M1 (derived when read): an open trade's unrealized P&L is a snapshot from before the cutoff; read at or after it.
+  "UNREALIZED_SNAPSHOT_AFTER_CUTOFF",
+  // Final review (derived when read): an older record whose instruments do not verifiably identify its contract.
+  "INSTRUMENT_IDENTITY_UNVERIFIED",
+] as const;
+export type PriceQualityFlag = (typeof PRICE_QUALITY_FLAGS)[number];
+/**
+ * The quality of the evidence behind a trade's shown P&L. MANUAL_ENTRY_CHECKED means the application's manual-input
+ * validation rules passed; it never means exchange-sourced, exchange-timestamped or independently verified.
+ */
+export interface PriceQualityDTO {
+  level: PriceQualityLevel;
+  flags: PriceQualityFlag[];
+  /** One plain-language warning per flag, in the same order. */
+  warnings: string[];
+  note: string;
+}
+export const EXPIRY_STATUSES = ["BEFORE_CUTOFF", "EXPIRED_REVIEW", "EXPIRED_PENDING_CLOSURE", "CLOSED"] as const;
+export type ExpiryStatus = (typeof EXPIRY_STATUSES)[number];
+/** Where a trade stands relative to its contract's provisional paper-safety cutoff, at the time of the response. */
+/**
+ * Final review: whether every leg's instrument identifies the contract in the structured fields (derived, never stored).
+ *  - CONSISTENT: every leg's manual instrument matches market, expiry, option type and strike (always true for
+ *    candidates accepted now).
+ *  - MISMATCH: an older record whose readable instrument differs in market, expiry, option type or strike.
+ *  - UNVERIFIABLE: an older record whose instrument cannot be read (opaque provider or malformed id).
+ * A record that is not CONSISTENT is never confirmed, monitored, exited or priced; it can only be closed unpriced.
+ */
+export const INSTRUMENT_CHECKS = ["CONSISTENT", "MISMATCH", "UNVERIFIABLE"] as const;
+export type InstrumentCheck = (typeof INSTRUMENT_CHECKS)[number];
+export interface ExpiryStatusDTO {
+  status: ExpiryStatus;
+  /** 15:30 Asia/Kolkata on the expiry date used (expiryUsed), e.g. 2026-10-06T15:30:00+05:30. */
+  cutoff: string;
+  /** The expiry date the safety rules use: the candidate expiry, or an earlier instrument expiry on an older record. */
+  expiryUsed: string;
+  instrumentCheck: InstrumentCheck;
+  /** Why the record is not CONSISTENT (empty when it is). */
+  instrumentReasons: string[];
+}
+/** A trade as the API returns it: the stored record plus derived fields. The journal only ever stores the record. */
+export type PaperTradeView = PaperTradeRecord & { priceQuality: PriceQualityDTO; expiryStatus: ExpiryStatusDTO };
 
 export type PaperErrorCode =
   | "INVALID_REQUEST"
@@ -331,6 +485,8 @@ export type PaperErrorCode =
   | "DATA_INSUFFICIENT"
   | "CAPITAL_GATE_FAILED"
   | "LOTS_UNRESOLVED"
+  | "QUOTE_NOT_FRESH"
+  | "CONTRACT_EXPIRED" // Phase 1B.2: the action is not allowed at or after the contract's provisional cutoff
   | "STORAGE_ERROR";
 
 export interface ApiErrorBody {

@@ -9,7 +9,7 @@ import type {
   MarketsResponse,
   MonitorRequestDTO,
   PaperLifecycleState,
-  PaperTradeRecord,
+  PaperTradeView,
   RiskFilter,
   SafetyCheckRequestDTO,
   SafetyCheckResponseDTO,
@@ -59,20 +59,20 @@ export const getMarkets = (): Promise<MarketsResponse> => getJson<MarketsRespons
 
 // ---- Phase 1B: paper trading ------------------------------------------------
 export const assessCandidate = (input: CandidateInputDTO): Promise<AssessResponseDTO> => postJson("/api/paper/assess", input);
-export const reviewCandidate = (input: CandidateInputDTO): Promise<PaperTradeRecord> => postJson("/api/paper/review", input);
-export const confirmTrade = (id: string, req: ConfirmRequestDTO): Promise<PaperTradeRecord> => postJson(`/api/paper/trades/${encodeURIComponent(id)}/confirm`, req);
-export const monitorTrade = (id: string, req: MonitorRequestDTO): Promise<PaperTradeRecord> => postJson(`/api/paper/trades/${encodeURIComponent(id)}/monitor`, req);
-export const exitTrade = (id: string, req: ExitRequestDTO): Promise<PaperTradeRecord> => postJson(`/api/paper/trades/${encodeURIComponent(id)}/exit`, req);
+export const reviewCandidate = (input: CandidateInputDTO): Promise<PaperTradeView> => postJson("/api/paper/review", input);
+export const confirmTrade = (id: string, req: ConfirmRequestDTO): Promise<PaperTradeView> => postJson(`/api/paper/trades/${encodeURIComponent(id)}/confirm`, req);
+export const monitorTrade = (id: string, req: MonitorRequestDTO): Promise<PaperTradeView> => postJson(`/api/paper/trades/${encodeURIComponent(id)}/monitor`, req);
+export const exitTrade = (id: string, req: ExitRequestDTO): Promise<PaperTradeView> => postJson(`/api/paper/trades/${encodeURIComponent(id)}/exit`, req);
 export const safetyCheck = (id: string, req: SafetyCheckRequestDTO): Promise<SafetyCheckResponseDTO> => postJson(`/api/paper/trades/${encodeURIComponent(id)}/safety-check`, req);
 
-export async function listTrades(options: { states?: readonly PaperLifecycleState[]; risk?: RiskFilter } = {}): Promise<PaperTradeRecord[]> {
+export async function listTrades(options: { states?: readonly PaperLifecycleState[]; risk?: RiskFilter } = {}): Promise<PaperTradeView[]> {
   const q = new URLSearchParams();
   if (options.states && options.states.length > 0) q.set("state", options.states.join(","));
   if (options.risk) q.set("risk", options.risk);
   const suffix = q.toString() === "" ? "" : `?${q.toString()}`;
-  return (await getJson<{ trades: PaperTradeRecord[] }>(`/api/paper/trades${suffix}`)).trades;
+  return (await getJson<{ trades: PaperTradeView[] }>(`/api/paper/trades${suffix}`)).trades;
 }
-export const getTrade = (id: string): Promise<{ trade: PaperTradeRecord; events: JournalEventRecord[] }> => getJson(`/api/paper/trades/${encodeURIComponent(id)}`);
+export const getTrade = (id: string): Promise<{ trade: PaperTradeView; events: JournalEventRecord[] }> => getJson(`/api/paper/trades/${encodeURIComponent(id)}`);
 export async function listJournal(): Promise<JournalEventRecord[]> {
   return (await getJson<{ events: JournalEventRecord[] }>("/api/paper/journal")).events;
 }

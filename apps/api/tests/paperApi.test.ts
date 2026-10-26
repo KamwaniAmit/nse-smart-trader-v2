@@ -21,7 +21,38 @@ const candidate = (over: Record<string, unknown> = {}) => ({
   spot: 22831.15, score: 62, expectedMove: 230, impliedMove: 180, expectedNetEdge: 700, iv: 0.15, rv20: 0.12, rvRegime: "RV_ACCELERATING",
   tradingDaysToExpiry: 8, maxCapitalAllocation: 100000, entryCosts: 250, requestedLots: 1, ...over,
 });
-const bids = (ce: number | null, pe: number | null) => ({ quotes: [{ instrument: CE, bid: ce }, { instrument: PE, bid: pe }] });
+/**
+ * Monitor / exit / safety prices for the exact legs. Phase 1B.2 (A2, HIGH-2): each price needs an ask and its own
+ * manual-entry time, so every quote carries ask = bid + 0.5 and the entry time PASSED BY THE TEST (normally serverNow()).
+ */
+const bids = (ce: number | null, pe: number | null, enteredAt: string) => {
+  const q = (instrument: typeof CE, bid: number | null) => ({ instrument, bid, ask: bid === null ? null : bid + 0.5, asOf: enteredAt });
+  return { quotes: [q(CE, ce), q(PE, pe)] };
+};
+
+// Phase 1B.1 (D3): the server clock is injected so expiry, safety and quote freshness are deterministic.
+const T0 = "2026-09-28T10:00:00.000Z";
+let clockMs = Date.parse(T0);
+/** Like a real clock it always moves forward: each read advances it by 1 ms, so creation order stays well defined. */
+const clockNow = (): string => {
+  const s = new Date(clockMs).toISOString();
+  clockMs += 1;
+  return s;
+};
+const setClock = (iso: string): void => {
+  clockMs = Date.parse(iso);
+};
+/** The server clock's CURRENT time, without moving it: the time the server will read next. */
+const serverNow = (): string => new Date(clockMs).toISOString();
+/** Phase 1B.1 (D1): fresh quotes for the exact legs of candidate(over), stamped with the server clock's time. */
+const confirmBody = (over: Record<string, unknown> = {}, asOf: string = clockNow()) => ({
+  confirmed: true,
+  quotes: (candidate(over).legs as Array<{ optionType: string; strike: number; quote: Record<string, unknown> }>).map((l) => ({
+    instrument: { provider: "manual", id: `NIFTY|2026-10-06|${l.optionType}|${l.strike}` },
+    ...l.quote,
+    asOf,
+  })),
+});
 
 interface Reply { status: number; body: any; headers: Record<string, string | string[] | undefined> } // eslint-disable-line @typescript-eslint/no-explicit-any
 function call(port: number, method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<Reply> {
@@ -53,13 +84,14 @@ let dir: string;
 let file: string;
 let servers: Server[] = [];
 async function start(path = file): Promise<number> {
-  const server = createApp(loadServerConfig({}), undefined, { paperService: createDefaultPaperService(path) }).listen(0, "127.0.0.1");
+  const server = createApp(loadServerConfig({}), undefined, { paperService: createDefaultPaperService(path, { now: clockNow }) }).listen(0, "127.0.0.1");
   await new Promise<void>((r) => server.once("listening", () => r()));
   servers.push(server);
   return (server.address() as AddressInfo).port;
 }
 const stop = (s: Server) => new Promise<void>((r) => s.close(() => r()));
 beforeEach(async () => {
+  setClock(T0);
   dir = await mkdtemp(join(tmpdir(), "nsest-api-"));
   file = join(dir, "journal.json");
 });
@@ -76,7 +108,7 @@ async function reviewed(port: number, over: Record<string, unknown> = {}): Promi
 }
 const opened = async (port: number, over: Record<string, unknown> = {}) => {
   const id = await reviewed(port, over);
-  expect((await call(port, "POST", `/api/paper/trades/${id}/confirm`, { confirmed: true })).status).toBe(200);
+  expect((await call(port, "POST", `/api/paper/trades/${id}/confirm`, confirmBody(over))).status).toBe(200);
   return id;
 };
 
@@ -147,7 +179,7 @@ describe("confirmation, monitoring, exit", () => {
     expect(no.status).toBe(400);
     expect(no.body.error).toBe("CONFIRMATION_REQUIRED");
     expect((await call(port, "GET", `/api/paper/trades/${id}`)).body.trade.state).toBe("PAPER_REVIEW");
-    const yes = await call(port, "POST", `/api/paper/trades/${id}/confirm`, { confirmed: true });
+    const yes = await call(port, "POST", `/api/paper/trades/${id}/confirm`, confirmBody());
     expect(yes.status).toBe(200);
     expect(yes.body).toMatchObject({ state: "PAPER_OPEN", entry: { combinedEntryPremium: 120.75, lots: 1 } });
   });
@@ -162,7 +194,7 @@ describe("confirmation, monitoring, exit", () => {
     const port = await start();
     const id = await opened(port);
     const before = (await call(port, "GET", `/api/paper/trades/${id}`)).body.trade;
-    const r = await call(port, "POST", `/api/paper/trades/${id}/monitor`, bids(66.05, 54));
+    const r = await call(port, "POST", `/api/paper/trades/${id}/monitor`, bids(66.05, 54, serverNow()));
     expect(r.status).toBe(200);
     expect(r.body.lastMonitor).toMatchObject({ dataStatus: "VALID", currentExitPremium: 120.05, unrealized: { grossPnl: -45.5 } });
     expect(r.body.entry).toEqual(before.entry);
@@ -171,7 +203,7 @@ describe("confirmation, monitoring, exit", () => {
   it("an exit with a missing bid is a 422 and the trade stays PAPER_OPEN", async () => {
     const port = await start();
     const id = await opened(port);
-    const r = await call(port, "POST", `/api/paper/trades/${id}/exit`, bids(null, 54));
+    const r = await call(port, "POST", `/api/paper/trades/${id}/exit`, bids(null, 54, serverNow()));
     expect(r.status).toBe(422);
     expect(r.body).toMatchObject({ error: "DATA_INSUFFICIENT", trade: { state: "PAPER_OPEN", exit: null } });
   });
@@ -186,16 +218,17 @@ describe("confirmation, monitoring, exit", () => {
   it("a valid exit is PAPER_EXITED with realized gross -45.50", async () => {
     const port = await start();
     const id = await opened(port);
-    const r = await call(port, "POST", `/api/paper/trades/${id}/exit`, bids(66.05, 54));
+    const r = await call(port, "POST", `/api/paper/trades/${id}/exit`, bids(66.05, 54, serverNow()));
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ state: "PAPER_EXITED", realizedPnl: { status: "VALID", grossPnl: -45.5 } });
-    expect((await call(port, "POST", `/api/paper/trades/${id}/exit`, bids(66.05, 54))).status).toBe(409);
+    expect((await call(port, "POST", `/api/paper/trades/${id}/exit`, bids(66.05, 54, serverNow()))).status).toBe(409);
   });
 
   it("safety check: after expiry with no price -> PAPER_EXPIRED and P&L DATA_INSUFFICIENT", async () => {
     const port = await start();
     const id = await opened(port);
-    const r = await call(port, "POST", `/api/paper/trades/${id}/safety-check`, { asOf: "2026-10-07T09:20:00+05:30" });
+    setClock("2026-10-07T03:50:00Z"); // 09:20 IST the day after expiry, by SERVER time
+    const r = await call(port, "POST", `/api/paper/trades/${id}/safety-check`, {});
     expect(r.status).toBe(200);
     expect(r.body.decision.action).toBe("EXPIRE");
     expect(r.body.trade).toMatchObject({ state: "PAPER_EXPIRED", exit: { basis: "NONE", exitPremium: null }, realizedPnl: { status: "DATA_INSUFFICIENT" } });
@@ -204,8 +237,70 @@ describe("confirmation, monitoring, exit", () => {
   it("safety check: holding limit with valid bids -> PAPER_AUTO_CLOSED", async () => {
     const port = await start();
     const id = await opened(port);
-    const r = await call(port, "POST", `/api/paper/trades/${id}/safety-check`, { asOf: "2026-10-01T15:00:00+05:30", completedSessions: 2, ...bids(66.05, 54) });
+    setClock("2026-10-01T09:30:00Z"); // 15:00 IST, server time
+    const r = await call(port, "POST", `/api/paper/trades/${id}/safety-check`, { completedSessions: 2, ...bids(66.05, 54, serverNow()) });
     expect(r.body.trade).toMatchObject({ state: "PAPER_AUTO_CLOSED", realizedPnl: { grossPnl: -45.5 } });
+  });
+});
+
+describe("Phase 1B.1 over HTTP", () => {
+  it("D1: confirming with a review-time quote 5 days later is a 422 QUOTE_NOT_FRESH; the trade stays in review", async () => {
+    const port = await start();
+    const id = await reviewed(port);
+    const reviewTime = clockNow();
+    setClock("2026-10-03T10:00:00Z");
+    const r = await call(port, "POST", `/api/paper/trades/${id}/confirm`, confirmBody({}, reviewTime));
+    expect(r.status).toBe(422);
+    expect(r.body).toMatchObject({ error: "QUOTE_NOT_FRESH", trade: { state: "PAPER_REVIEW", entry: null } });
+  });
+
+  it("D1: confirmed: true without quotes is refused (the review price is never reused)", async () => {
+    const port = await start();
+    const id = await reviewed(port);
+    const r = await call(port, "POST", `/api/paper/trades/${id}/confirm`, { confirmed: true });
+    expect(r.status).toBe(422);
+    expect(r.body.error).toBe("DATA_INSUFFICIENT");
+  });
+
+  it("D1: a fresh confirmation records the quote times in the entry snapshot", async () => {
+    const port = await start();
+    const id = await opened(port);
+    const t = (await call(port, "GET", `/api/paper/trades/${id}`)).body.trade;
+    expect(t.entry).toMatchObject({ snapshotVersion: 2, quoteFreshness: { maxQuoteAgeMs: 60000 } });
+    for (const l of t.entry.legs as Array<{ quoteAsOf: string; quoteAgeMs: number }>) {
+      expect(l.quoteAsOf).toMatch(/^2026-09-28T10:00:00\.\d{3}Z$/);
+      expect(l.quoteAgeMs).toBeGreaterThanOrEqual(0);
+      expect(l.quoteAgeMs).toBeLessThan(60_000);
+    }
+  });
+
+  it("D2: expiry after a monitored bid, with no current bid, is DATA_INSUFFICIENT with the old bid as reference only", async () => {
+    const port = await start();
+    const id = await opened(port);
+    expect((await call(port, "POST", `/api/paper/trades/${id}/monitor`, bids(66.05, 54, serverNow()))).status).toBe(200);
+    setClock("2026-10-07T03:50:00Z");
+    const r = await call(port, "POST", `/api/paper/trades/${id}/safety-check`, {});
+    expect(r.body.trade).toMatchObject({
+      state: "PAPER_EXPIRED",
+      exit: { basis: "NONE", exitPremium: null, valuationStatus: "DATA_INSUFFICIENT", staleReference: { exitPremium: 120.05 } },
+      realizedPnl: { status: "DATA_INSUFFICIENT", grossPnl: null },
+    });
+  });
+
+  it("D3: a client future asOf cannot force expiry (400), and a bare date is rejected", async () => {
+    const port = await start();
+    const id = await opened(port);
+    expect((await call(port, "POST", `/api/paper/trades/${id}/safety-check`, { asOf: "2030-01-01T00:00:00Z" })).status).toBe(400);
+    expect((await call(port, "POST", `/api/paper/trades/${id}/safety-check`, { asOf: "2026-10-07" })).status).toBe(400);
+    expect((await call(port, "GET", `/api/paper/trades/${id}`)).body.trade.state).toBe("PAPER_OPEN");
+  });
+
+  it("D3: an exit timestamped before the entry is a 400 and the trade stays open", async () => {
+    const port = await start();
+    const id = await opened(port);
+    const r = await call(port, "POST", `/api/paper/trades/${id}/exit`, { ...bids(66.05, 54, serverNow()), asOf: "2026-09-01T10:00:00+05:30" });
+    expect(r.status).toBe(400);
+    expect((await call(port, "GET", `/api/paper/trades/${id}`)).body.trade.state).toBe("PAPER_OPEN");
   });
 });
 
@@ -267,7 +362,7 @@ describe("persistence through the API", () => {
   it("a restarted server (new process state, same file) still has the trade, entry snapshot and events", async () => {
     const first = await start();
     const id = await opened(first);
-    await call(first, "POST", `/api/paper/trades/${id}/monitor`, bids(66.05, 54));
+    await call(first, "POST", `/api/paper/trades/${id}/monitor`, bids(66.05, 54, serverNow()));
     const snapshot = (await call(first, "GET", `/api/paper/trades/${id}`)).body;
     await Promise.all(servers.map(stop));
     servers = [];

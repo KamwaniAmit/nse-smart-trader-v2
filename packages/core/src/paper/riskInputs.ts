@@ -19,8 +19,10 @@ const minOrNull = (values: ReadonlyArray<number | null>): number | null => {
  */
 export function buildRiskInputs(candidate: PaperCandidate, capital: CapitalAssessment): RiskInputs {
   const entry = assessEntry(candidate);
-  const lots = capital.lots ?? 1;
-  const orderQty = lots * candidate.lotSize;
+  // Phase 1B.1 (D5): an unknown, zero or invalid lot count is NOT assumed to be one lot. The order size is then
+  // unknown, so contractLiquidity (depth / order size) is unavailable and stays null.
+  const lots = typeof capital.lots === "number" && Number.isInteger(capital.lots) && capital.lots >= 1 ? capital.lots : null;
+  const orderQty = lots === null ? null : lots * candidate.lotSize;
 
   const depth = minOrNull(
     candidate.legs.map((leg) => (leg.quote.bidQty !== null && leg.quote.askQty !== null ? Math.min(leg.quote.bidQty, leg.quote.askQty) : null)),
@@ -46,7 +48,7 @@ export function buildRiskInputs(candidate: PaperCandidate, capital: CapitalAsses
     maxLossDefined: true,
     liquidityVolume: minOrNull(candidate.legs.map((l) => l.quote.volume)),
     openInterest: minOrNull(candidate.legs.map((l) => l.quote.oi)),
-    contractLiquidity: depth === null || orderQty <= 0 ? null : round4(depth / orderQty),
+    contractLiquidity: depth === null || orderQty === null || orderQty <= 0 ? null : round4(depth / orderQty),
     expectedNetEdgeQuality: netEdgeRatio,
     ivRvRelationship: ivRv,
     rvRegime: candidate.rvRegime,

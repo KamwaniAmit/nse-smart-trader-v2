@@ -57,10 +57,14 @@ describe("candidate parsing: strictness (nothing is guessed or repaired)", () =>
     expect(r.value.dataSource).toBe("MANUAL");
     expect(r.value.legs.map((l) => l.instrument)).toEqual([CE_ID, PE_ID]);
   });
-  it("keeps a supplied instrument identity exactly", () => {
-    const r = parse(longVolRaw({ legs: [{ ...ce(22900), instrument: { provider: "p", id: "abc" } }, pe(22800)] }));
+  // Final review: rewritten. An opaque instrument ({ provider: "p", id: "abc" }) used to be accepted, but its expiry cannot
+  // be verified, so it could bypass the expiry cutoff; it is now refused (tests below). A supplied, consistent instrument is
+  // still kept exactly as given (never rewritten).
+  it("keeps a supplied instrument identity exactly (a manual instrument naming the candidate expiry)", () => {
+    const supplied = { provider: "manual", id: "NIFTY|2026-10-06|CE|22900" };
+    const r = parse(longVolRaw({ legs: [{ ...ce(22900), instrument: supplied }, pe(22800)] }));
     if (!r.ok) throw new Error("parse failed");
-    expect(r.value.legs[0]?.instrument).toEqual({ provider: "p", id: "abc" });
+    expect(r.value.legs[0]?.instrument).toEqual(supplied);
   });
   it("requires an explicit lot size (none is assumed)", () => {
     const raw = longVolRaw();
@@ -115,10 +119,72 @@ describe("request parsing: confirm, monitor, exit, safety check", () => {
     expect(parseExitRequest({}).ok).toBe(false);
     expect(parseExitRequest({ quotes: [{ bid: 5 }] }).ok).toBe(false);
   });
-  it("safety check needs asOf; completedSessions must be a whole number", () => {
-    expect(parseSafetyCheckRequest({}).ok).toBe(false);
-    expect(parseSafetyCheckRequest({ asOf: "2026-10-07" }).ok).toBe(true);
-    expect(parseSafetyCheckRequest({ asOf: "2026-10-07", completedSessions: 1.5 }).ok).toBe(false);
+  // Phase 1B.1 (D3): asOf is now OPTIONAL and untrusted (the server clock decides expiry and safety), and an event
+  // time must be a full timestamp with a zone. A bare date is ambiguous and is rejected.
+  it("safety check: asOf is optional but must be a full timestamp with a zone; completedSessions must be a whole number", () => {
+    expect(parseSafetyCheckRequest({}).ok).toBe(true);
+    expect(parseSafetyCheckRequest({ asOf: "2026-10-07T09:20:00+05:30" }).ok).toBe(true);
+    expect(parseSafetyCheckRequest({ asOf: "2026-10-07" }).ok).toBe(false);
+    expect(parseSafetyCheckRequest({ completedSessions: 1.5 }).ok).toBe(false);
     expect(parseSafetyCheckRequest({ asOf: "not a date" }).ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Final review: an explicit leg instrument must identify exactly the leg's contract. The existing manual format
+// "<market>|<YYYY-MM-DD>|<CE or PE>|<strike>" is compared part by part with what the parser's own builder produces
+// (marketId, expiry, optionType, String(strike)). Nothing is rewritten and no other normalisation is applied.
+describe("final review: an explicit instrument must match market, expiry, option type and strike", () => {
+  const withCe = (instrument: unknown, over: Record<string, unknown> = {}) => longVolRaw({ legs: [{ ...ce(22900), instrument }, pe(22800)], ...over });
+  const m = (id: string) => ({ provider: "manual", id });
+  const ceErrors = (id: string, over: Record<string, unknown> = {}) => errorsOf(withCe(m(id), over)).filter((e) => e.startsWith("legs[0].instrument: "));
+
+  it("matching instruments on every supported leg type (CE and PE) are accepted and kept exactly", () => {
+    const r = parse(longVolRaw({ legs: [{ ...ce(22900), instrument: m("NIFTY|2026-10-06|CE|22900") }, { ...pe(22800), instrument: m("NIFTY|2026-10-06|PE|22800") }] }));
+    if (!r.ok) throw new Error(`parse failed: ${r.errors.join("; ")}`);
+    expect(r.value.expiry).toBe("2026-10-06");
+    expect(r.value.legs.map((l) => l.instrument.id)).toEqual(["NIFTY|2026-10-06|CE|22900", "NIFTY|2026-10-06|PE|22800"]);
+  });
+  it("a matching instrument on a single-leg structure (SINGLE_PUT) and another market (BANKNIFTY) is accepted", () => {
+    expect(parse(longVolRaw({ source: "BEST_OPPORTUNITY", structure: "SINGLE_PUT", legs: [{ ...pe(22800), instrument: m("NIFTY|2026-10-06|PE|22800") }] })).ok).toBe(true);
+    expect(parse(longVolRaw({ marketId: "BANKNIFTY", legs: [{ ...ce(52000), instrument: m("BANKNIFTY|2026-10-06|CE|52000") }, pe(51500)] })).ok).toBe(true);
+  });
+  it("a fractional strike matches when written as the builder writes it", () => {
+    expect(parse(longVolRaw({ legs: [{ ...ce(22900.5), instrument: m("NIFTY|2026-10-06|CE|22900.5") }, pe(22800)] })).ok).toBe(true);
+  });
+  it.each([
+    ["market mismatch", "BANKNIFTY|2026-10-06|CE|22900", /instrument market "BANKNIFTY" does not match the market "NIFTY" \(neither is rewritten\)/],
+    ["option-type mismatch", "NIFTY|2026-10-06|PE|22900", /instrument option type "PE" does not match the option type "CE"/],
+    ["strike mismatch", "NIFTY|2026-10-06|CE|23000", /instrument strike "23000" does not match the strike "22900"/],
+    ["strike written differently", "NIFTY|2026-10-06|CE|22900.0", /instrument strike "22900.0" does not match the strike "22900"/],
+    ["later expiry", "NIFTY|2026-12-29|CE|22900", /instrument expiry "2026-12-29" does not match the expiry "2026-10-06" \(neither is rewritten\)/],
+    ["earlier expiry", "NIFTY|2026-09-29|CE|22900", /instrument expiry "2026-09-29" does not match the expiry "2026-10-06"/],
+    ["missing expiry", "NIFTY||CE|22900", /has no expiry/],
+    ["impossible date", "NIFTY|2026-13-40|CE|22900", /not a real calendar date/],
+    ["non-ISO date", "NIFTY|06-10-2026|CE|22900", /not a real calendar date/],
+    ["date with a time", "NIFTY|2026-10-06T15:30|CE|22900", /not a real calendar date/],
+    ["empty market", "|2026-10-06|CE|22900", /with no empty part/],
+    ["empty option type", "NIFTY|2026-10-06||22900", /with no empty part/],
+    ["empty strike", "NIFTY|2026-10-06|CE|", /with no empty part/],
+    ["too few parts", "NIFTY|2026-10-06|CE", /must be "<market>\|<expiry YYYY-MM-DD>\|<CE or PE>\|<strike>"/],
+    ["too many parts", "NIFTY|2026-10-06|CE|22900|x", /must be "<market>\|<expiry YYYY-MM-DD>\|<CE or PE>\|<strike>"/],
+  ])("%s is refused (legs[0].instrument) and the candidate is not accepted", (_n, id, message) => {
+    expect(ceErrors(id).some((e) => message.test(e))).toBe(true);
+  });
+  it("every mismatching part is reported, not just the first", () => {
+    expect(ceErrors("BANKNIFTY|2026-12-29|PE|23000")).toHaveLength(4);
+  });
+  it("an opaque provider is refused: none of its fields can be verified (it could bypass the cutoff)", () => {
+    expect(errorsOf(withCe({ provider: "p", id: "abc" })).join(" ")).toMatch(/legs\[0\]\.instrument: a "p" instrument cannot be verified/);
+  });
+  it("an invalid structured field reports its own error; the instrument is not also compared with it", () => {
+    const errors = errorsOf(withCe(m("NIFTY|2026-10-06|CE|22900"), { expiry: "2026-02-30" }));
+    expect(errors).toContain("expiry must be a real calendar date, YYYY-MM-DD");
+    expect(errors.join(" ")).not.toMatch(/does not match/);
+  });
+  it("a leg with no explicit instrument still gets the manual identity built from the structured fields", () => {
+    const r = parse(longVolRaw());
+    if (!r.ok) throw new Error("parse failed");
+    expect(r.value.legs.map((l) => l.instrument)).toEqual([CE_ID, PE_ID]);
   });
 });

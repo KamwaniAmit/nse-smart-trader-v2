@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { JOURNAL_DURABILITY_NOTICE } from "@nsest/core/contracts";
-import type { JournalEventRecord, PaperPnl, PaperTradeRecord } from "@nsest/core/contracts";
+import type { ExpiryStatusDTO, JournalEventRecord, PaperPnl, PaperTradeRecord, PriceQualityDTO } from "@nsest/core/contracts";
 import { ApiError, confirmTrade, exitTrade, monitorTrade, safetyCheck } from "../apiClient";
 import { inr, num, pnlText } from "../format";
 import { QuoteForm } from "./QuoteForm";
@@ -9,7 +9,8 @@ import { RiskPanel } from "./RiskPanel";
 import { StatusBadge } from "./StatusBadge";
 
 interface Props {
-  trade: PaperTradeRecord;
+  /** The trade as the API returns it. priceQuality / expiryStatus are derived by the server (Phase 1B.2). */
+  trade: PaperTradeRecord & { priceQuality?: PriceQualityDTO; expiryStatus?: ExpiryStatusDTO };
   events: readonly JournalEventRecord[];
   /** Called after ANY action attempt (success or refusal) so the lists and the journal reload. */
   onChanged: () => void;
@@ -63,6 +64,17 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
   }
 
   const costs: ExtraField = { key: "exitCosts", label: "Exit costs (₹, optional)" };
+  const quality = trade.priceQuality;
+  /** M1 / final review: the server says the unrealized P&L is a historical snapshot (read at or after the cutoff). */
+  const historicalSnapshot = quality?.level === "HISTORICAL_SNAPSHOT" || (quality?.flags.includes("UNREALIZED_SNAPSHOT_AFTER_CUTOFF") ?? false);
+  const expiryStatus = trade.expiryStatus?.status;
+  /** Final review: the expiry the safety rules use (an older record may name an earlier instrument expiry). */
+  const expiryUsed = trade.expiryStatus?.expiryUsed ?? trade.candidate.expiry;
+  const instrumentCheck = trade.expiryStatus?.instrumentCheck;
+  /** Final review: an older record whose instruments do not verifiably identify its contract: no confirm, monitor or exit. */
+  const unverifiedInstruments = instrumentCheck === "MISMATCH" || instrumentCheck === "UNVERIFIABLE";
+  const exit = trade.exit;
+  const manualChecked = exit?.valuationStatus === "MANUAL_ENTRY_CHECKED";
 
   return (
     <section aria-label={`Trade ${trade.tradeId}`}>
@@ -83,18 +95,33 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
       <p>
         Entry premium (sum of asks): <strong>{inr(premium)}</strong> per unit · lot size {trade.candidate.lotSize} · lots {num(entry ? entry.lots : capital.lots)}
       </p>
-      <table>
-        <thead>
-          <tr><th>Leg</th><th>Strike</th><th>Ask (entry)</th><th>Bid at entry</th></tr>
-        </thead>
-        <tbody>
-          {trade.candidate.legs.map((l) => (
-            <tr key={l.instrument.id}>
-              <td>{l.optionType}</td><td>{l.strike}</td><td>{num(l.quote.ask)}</td><td>{num(l.quote.bid)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {entry ? (
+        <table>
+          <thead>
+            <tr><th>Leg</th><th>Strike</th><th>Ask (entry)</th><th>Bid at entry</th><th>Quote entry time (user-entered)</th></tr>
+          </thead>
+          <tbody>
+            {entry.legs.map((l) => (
+              <tr key={l.instrument.id}>
+                <td>{l.optionType}</td><td>{l.strike}</td><td>{num(l.entryAsk)}</td><td>{num(l.entryBid)}</td><td>{l.quoteAsOf ?? "not recorded (v1 snapshot)"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <table>
+          <thead>
+            <tr><th>Leg</th><th>Strike</th><th>Ask (review)</th><th>Bid (review)</th></tr>
+          </thead>
+          <tbody>
+            {trade.candidate.legs.map((l) => (
+              <tr key={l.instrument.id}>
+                <td>{l.optionType}</td><td>{l.strike}</td><td>{num(l.quote.ask)}</td><td>{num(l.quote.bid)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
       <p>
         Capital requirement {inr(capital.totalCapitalRequirement)} per lot (premium {inr(capital.premiumRequirement)} + costs {inr(capital.entryCosts)}) · allocation {inr(capital.maxCapitalAllocation)} · gate <strong>{capital.gate}</strong>
         {capital.utilizationPct !== null ? ` · utilization ${capital.utilizationPct}%` : ""}
@@ -115,8 +142,8 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
       {trade.state === "PAPER_OPEN" ? (
         trade.lastMonitor ? (
           <>
-            <PnlLine label="Unrealized P&L" pnl={trade.lastMonitor.unrealized} />
-            <p className="hint">As of {trade.lastMonitor.asOf}. Exit premium now {inr(trade.lastMonitor.currentExitPremium)} (sum of bids). {trade.lastMonitor.dataReasons.join("; ")}</p>
+            <PnlLine label={historicalSnapshot ? "Unrealized P&L (historical snapshot recorded before the expiry cutoff; not a current or executable price, not exchange-verified, not realized P&L)" : "Unrealized P&L"} pnl={trade.lastMonitor.unrealized} />
+            <p className="hint">Recorded by the server at {trade.lastMonitor.asOf} (processing time; these quotes carry no observation time). Exit premium when recorded {inr(trade.lastMonitor.currentExitPremium)} (sum of bids); not refreshed since. {trade.lastMonitor.dataReasons.join("; ")}</p>
           </>
         ) : (
           <p>Not monitored yet: no executable bids have been recorded.</p>
@@ -125,13 +152,42 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
       {trade.realizedPnl ? (
         <>
           <PnlLine label="Realized P&L" pnl={trade.realizedPnl} />
-          {trade.exit ? (
+          {exit && manualChecked ? (
+            <p className="hint" data-valuation="MANUAL_ENTRY_CHECKED">
+              {exit.trigger} · valued from prices you entered · the application&apos;s manual-input checks passed (valid bid and ask, entered at most 60 s before the server processed them) · not exchange-sourced, exchange-timestamped or independently verified
+              {` · processed by the server at ${exit.timestamp}`}
+              {" · exit premium "}{inr(exit.exitPremium)}
+            </p>
+          ) : null}
+          {exit && !manualChecked ? (
             <p className="hint">
-              {trade.exit.trigger} · price basis {trade.exit.basis}
-              {trade.exit.priceAsOf ? ` (as of ${trade.exit.priceAsOf})` : ""} · exit premium {inr(trade.exit.exitPremium)} {trade.exit.notes.join(" ")}
+              {exit.trigger} · price basis {exit.basis}
+              {exit.valuationStatus ? ` · valuation ${exit.valuationStatus}` : ""}
+              {` · processed by the server at ${exit.timestamp}`}
+              {exit.priceAsOf
+                ? ` · price time ${exit.priceAsOf} recorded by an earlier version; not a verified quote-observation time`
+                : " · quote observation time: not available"}
+              {" · exit premium "}{inr(exit.exitPremium)} {exit.notes.join(" ")}
+            </p>
+          ) : null}
+          {exit?.trigger === "EXPIRY" && exit.exitPremium === null ? (
+            <p className="hint">No approved settlement-price source: the expiry closure has no exit price, so its P&amp;L is not available.</p>
+          ) : null}
+          {exit?.trigger === "HOLDING_LIMIT" ? (
+            <p className="hint">Holding limit: the completed-session count was entered by you (session count entered by you; there is no trading calendar).</p>
+          ) : null}
+          {trade.exit?.staleReference ? (
+            <p className="hint" data-stale-reference="true">
+              Reference only (not an exit price, not used for P&amp;L): last valid monitored bids recorded by the server at {trade.exit.staleReference.asOf}, exit premium {inr(trade.exit.staleReference.exitPremium)}.
             </p>
           ) : null}
         </>
+      ) : null}
+      {quality ? (
+        <div className="hint" data-price-quality={quality.level}>
+          <p>Price quality: <strong>{quality.level}</strong>. {quality.note}</p>
+          {quality.warnings.length > 0 ? <ul>{quality.warnings.map((w) => <li key={w}>{w}</li>)}</ul> : null}
+        </div>
       ) : null}
       {trade.state === "DATA_INSUFFICIENT" ? (
         <p data-pnl-status="DATA_INSUFFICIENT">
@@ -139,38 +195,68 @@ export function TradeDetail({ trade, events, onChanged }: Props) {
         </p>
       ) : null}
 
-      {trade.state === "PAPER_REVIEW" ? (
-        <fieldset>
-          <legend>Confirm paper trade</legend>
+      {unverifiedInstruments ? (
+        <div className="notice" data-instrument-check={instrumentCheck}>
+          <p>
+            {instrumentCheck === "MISMATCH"
+              ? `Older record: a leg's instrument does not match its market, expiry, option type or strike (instrument check MISMATCH). The expiry cutoff uses the earliest date named, ${expiryUsed}.`
+              : `Older record: a leg's instrument could not be verified (instrument check UNVERIFIABLE). The expiry cutoff uses the candidate expiry, ${expiryUsed}, which is NOT verified.`}{" "}
+            No price can be attributed to this record: it cannot be confirmed, monitored or exited. An open trade can only be closed, unpriced, by the safety check.
+          </p>
+          {(trade.expiryStatus?.instrumentReasons ?? []).length > 0 ? <ul>{(trade.expiryStatus?.instrumentReasons ?? []).map((r) => <li key={r}>{r}</li>)}</ul> : null}
+        </div>
+      ) : null}
+      {trade.state === "PAPER_REVIEW" && expiryStatus === "EXPIRED_REVIEW" ? (
+        <p className="notice" data-expiry-status="EXPIRED_REVIEW">
+          This review&apos;s contract expired at 15:30 IST on {expiryUsed} (provisional paper-safety cutoff), so it cannot be confirmed. It stays in PAPER_REVIEW as history.
+        </p>
+      ) : null}
+      {trade.state === "PAPER_REVIEW" && expiryStatus !== "EXPIRED_REVIEW" && !unverifiedInstruments ? (
+        <>
           <p>Nothing is open yet. Confirming records the entry snapshot and opens a PAPER trade. No real order is ever placed.</p>
-          <label>
-            <input type="checkbox" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} />
-            I confirm this paper trade
-          </label>{" "}
-          <button type="button" disabled={!confirmed || busy} onClick={() => void run(async () => void (await confirmTrade(trade.tradeId, { confirmed: true })), "Paper trade opened.")}>
-            Confirm paper trade
-          </button>
-        </fieldset>
+          <p className="hint">
+            The review prices above are history. A paper trade opens only at FRESH prices: enter the current bid and ask for each leg (at most 60 seconds old). Entry premium, capital and entry risk are recalculated from them.
+          </p>
+          <QuoteForm
+            title="Confirm paper trade" legs={legs} extended timestamped disabled={!confirmed || busy} submitLabel="Confirm paper trade" extra={[]}
+            beforeSubmit={
+              <label>
+                <input type="checkbox" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} />
+                I confirm this paper trade
+              </label>
+            }
+            onSubmit={(quotes) => void run(async () => void (await confirmTrade(trade.tradeId, { confirmed: true, quotes })), "Paper trade opened.")}
+          />
+        </>
       ) : null}
 
-      {trade.state === "PAPER_OPEN" ? (
+      {trade.state === "PAPER_OPEN" && expiryStatus === "EXPIRED_PENDING_CLOSURE" ? (
+        <p className="notice" data-expiry-status="EXPIRED_PENDING_CLOSURE">
+          Contract expired at 15:30 IST on {expiryUsed} (provisional paper-safety cutoff). Monitoring and exit are closed; run the safety check to record the expiry closure. There is no approved settlement-price source, so its P&amp;L will be DATA_INSUFFICIENT.
+        </p>
+      ) : null}
+      {trade.state === "PAPER_OPEN" && expiryStatus !== "EXPIRED_PENDING_CLOSURE" && !unverifiedInstruments ? (
         <>
           <QuoteForm
-            title="Monitor" legs={legs} extended disabled={busy} submitLabel="Record monitor update"
+            title="Monitor" legs={legs} extended timestamped disabled={busy} submitLabel="Record monitor update"
             extra={[{ key: "tradingDaysToExpiry", label: "Trading days to expiry" }, { key: "spot", label: "Spot" }, costs]}
             onSubmit={(quotes, x) => void run(async () => void (await monitorTrade(trade.tradeId, { quotes, tradingDaysToExpiry: optNum(x["tradingDaysToExpiry"]), spot: optNum(x["spot"]), exitCosts: optNum(x["exitCosts"]) })), "Monitor update recorded.")}
           />
           <QuoteForm
-            title="Exit" legs={legs} disabled={busy} submitLabel="Exit paper trade" extra={[costs]}
+            title="Exit" legs={legs} withAsk timestamped disabled={busy} submitLabel="Exit paper trade" extra={[costs]}
             onSubmit={(quotes, x) => void run(async () => void (await exitTrade(trade.tradeId, { quotes, exitCosts: optNum(x["exitCosts"]) })), "Paper trade exited.")}
           />
+        </>
+      ) : null}
+      {trade.state === "PAPER_OPEN" ? (
+        <>
           <QuoteForm
-            title="Safety check" legs={legs} disabled={busy} submitLabel="Run safety check"
-            extra={[{ key: "asOf", label: "As of (YYYY-MM-DD or timestamp)" }, { key: "completedSessions", label: "Completed sessions (optional)", hint: "No trading calendar exists: if blank, the holding limit is not evaluated." }, costs]}
+            title="Safety check" legs={legs} withAsk timestamped disabled={busy} submitLabel="Run safety check"
+            extra={[{ key: "completedSessions", label: "Completed sessions (optional)", hint: "No trading calendar exists: if blank, the holding limit is not evaluated. Expiry is judged on the server clock: the provisional 15:30 IST cutoff on the expiry date." }, costs]}
             onSubmit={(quotes, x) =>
               void run(
                 async () => {
-                  const res = await safetyCheck(trade.tradeId, { asOf: x["asOf"] ?? "", completedSessions: optNum(x["completedSessions"]), quotes, exitCosts: optNum(x["exitCosts"]) });
+                  const res = await safetyCheck(trade.tradeId, { completedSessions: optNum(x["completedSessions"]), quotes, exitCosts: optNum(x["exitCosts"]) });
                   if (res.decision.action === "NONE") return `No safety closure applies. ${res.decision.notEvaluated.join(" ")}`.trim();
                   return undefined;
                 },

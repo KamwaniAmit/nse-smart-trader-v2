@@ -1,9 +1,9 @@
 import type {
   CandidateInputDTO,
   ConfirmRequestDTO,
+  EntryQuoteDTO,
   ExitRequestDTO,
   InstrumentRefDTO,
-  LegQuoteDTO,
   MonitorRequestDTO,
   PaperCandidate,
   PaperLeg,
@@ -11,6 +11,8 @@ import type {
   SafetyCheckRequestDTO,
 } from "../contracts/index.js";
 import { MARKET_IDS, PAPER_SOURCES, PAPER_STRUCTURES } from "../contracts/index.js";
+import { instrumentIdentityProblems } from "./instrumentIdentity.js";
+import { isStrictTimestamp } from "./time.js";
 
 // Strict parsing of untyped JSON. Anything malformed is an error: nothing is silently repaired or defaulted
 // (except explicit optional fields, which become null).
@@ -124,8 +126,21 @@ export function parseCandidateInput(raw: unknown, ctx: { now: string; newId: () 
       if (l["strike"] === undefined || l["strike"] === null) sub.push("strike is required");
       for (const e of sub) errs.push(`${where}.${e}`);
       let instrument: InstrumentRefDTO | null = null;
-      if (l["instrument"] !== undefined && l["instrument"] !== null) instrument = instrumentRef(l["instrument"], `${where}.instrument`, errs);
-      else if ((optionType === "CE" || optionType === "PE") && strike !== null && typeof marketId === "string" && typeof expiry === "string") {
+      if (l["instrument"] !== undefined && l["instrument"] !== null) {
+        instrument = instrumentRef(l["instrument"], `${where}.instrument`, errs);
+        // Final review: an explicit instrument must identify exactly this leg's contract (market, expiry, option type,
+        // strike), because the expiry cutoff and every price are attached to it. An unreadable instrument is always refused;
+        // each structured field is compared only when that field is itself valid (its own error is reported otherwise).
+        if (instrument !== null) {
+          const problems = instrumentIdentityProblems(instrument, {
+            ...(typeof marketId === "string" && (MARKET_IDS as readonly string[]).includes(marketId) ? { marketId } : {}),
+            ...(typeof expiry === "string" && isRealDate(expiry) ? { expiry } : {}),
+            ...(optionType === "CE" || optionType === "PE" ? { optionType } : {}),
+            ...(strike !== null ? { strike } : {}),
+          });
+          for (const p of problems) errs.push(`${where}.instrument: ${p}`);
+        }
+      } else if ((optionType === "CE" || optionType === "PE") && strike !== null && typeof marketId === "string" && typeof expiry === "string") {
         instrument = manualInstrument(marketId, expiry, optionType, strike);
       }
       const quote = parseQuote(l["quote"], where, errs);
@@ -200,7 +215,7 @@ export function parseCandidateInput(raw: unknown, ctx: { now: string; newId: () 
   };
 }
 
-function parseLegQuotes(raw: unknown, key: string, errs: string[], required: boolean): LegQuoteDTO[] {
+function parseLegQuotes(raw: unknown, key: string, errs: string[], required: boolean, withAsOf = false): EntryQuoteDTO[] {
   if (raw === undefined || raw === null) {
     if (required) errs.push(`${key} is required`);
     return [];
@@ -209,7 +224,7 @@ function parseLegQuotes(raw: unknown, key: string, errs: string[], required: boo
     errs.push(`${key} must be an array`);
     return [];
   }
-  const out: LegQuoteDTO[] = [];
+  const out: EntryQuoteDTO[] = [];
   raw.forEach((q: unknown, i) => {
     const where = `${key}[${i}]`;
     if (!isObj(q)) {
@@ -226,29 +241,41 @@ function parseLegQuotes(raw: unknown, key: string, errs: string[], required: boo
     const volume = num(q, "volume", sub, { min: 0 });
     const oi = num(q, "oi", sub, { min: 0 });
     for (const e of sub) errs.push(`${where}.${e}`);
-    if (instrument !== null) out.push({ instrument, bid, ask, ltp, bidQty, askQty, volume, oi });
+    // Phase 1B.1 (D1) / 1B.2 (A2): a quote keeps its OWN user-entry time. It is untrusted and is checked against the
+    // server clock by the service (so a bad time is reported, never silently dropped).
+    const asOfRaw = q["asOf"];
+    const asOf = withAsOf && asOfRaw !== undefined && asOfRaw !== null ? String(asOfRaw) : undefined;
+    if (instrument !== null) out.push({ instrument, bid, ask, ltp, bidQty, askQty, volume, oi, ...(asOf !== undefined ? { asOf } : {}) });
   });
   return out;
 }
 
+/**
+ * An optional client EVENT time (Phase 1B.1, D3). It must be a full timestamp WITH a zone; a bare date or a zoneless
+ * time is ambiguous and rejected. Ordering and clock skew are checked by the service against the server clock.
+ */
 function optionalTimestamp(raw: Record<string, unknown>, key: string, errs: string[]): string | undefined {
   const v = raw[key];
   if (v === undefined || v === null) return undefined;
-  if (typeof v === "string" && isTimestamp(v)) return v;
-  errs.push(`${key} must be an ISO date or timestamp`);
+  if (isStrictTimestamp(v)) return v;
+  errs.push(`${key} must be a full timestamp with a zone, e.g. 2026-10-01T10:00:00+05:30`);
   return undefined;
 }
 
 export function parseConfirmRequest(raw: unknown): ParseResult<ConfirmRequestDTO> {
   if (!isObj(raw)) return { ok: false, errors: ["Request body must be a JSON object"] };
   if (typeof raw["confirmed"] !== "boolean") return { ok: false, errors: ["confirmed must be a boolean"] };
-  return { ok: true, value: { confirmed: raw["confirmed"] } };
+  const errs: string[] = [];
+  const quotes = raw["quotes"] === undefined || raw["quotes"] === null ? undefined : parseLegQuotes(raw["quotes"], "quotes", errs, true, true);
+  if (errs.length > 0) return { ok: false, errors: errs };
+  return { ok: true, value: { confirmed: raw["confirmed"], ...(quotes !== undefined ? { quotes } : {}) } };
 }
 
 export function parseMonitorRequest(raw: unknown): ParseResult<MonitorRequestDTO> {
   if (!isObj(raw)) return { ok: false, errors: ["Request body must be a JSON object"] };
   const errs: string[] = [];
-  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, true);
+  // Phase 1B.2 (A2): each price keeps its own manual-entry time; the service checks it against the server clock.
+  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, true, true);
   const asOf = optionalTimestamp(raw, "asOf", errs);
   const tradingDaysToExpiry = num(raw, "tradingDaysToExpiry", errs, { min: 0, integer: true });
   const spot = num(raw, "spot", errs, { positive: true });
@@ -260,7 +287,8 @@ export function parseMonitorRequest(raw: unknown): ParseResult<MonitorRequestDTO
 export function parseExitRequest(raw: unknown): ParseResult<ExitRequestDTO> {
   if (!isObj(raw)) return { ok: false, errors: ["Request body must be a JSON object"] };
   const errs: string[] = [];
-  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, true);
+  // Phase 1B.2 (A2): each price keeps its own manual-entry time; the service checks it against the server clock.
+  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, true, true);
   const asOf = optionalTimestamp(raw, "asOf", errs);
   const exitCosts = num(raw, "exitCosts", errs, { min: 0 });
   if (errs.length > 0) return { ok: false, errors: errs };
@@ -270,13 +298,13 @@ export function parseExitRequest(raw: unknown): ParseResult<ExitRequestDTO> {
 export function parseSafetyCheckRequest(raw: unknown): ParseResult<SafetyCheckRequestDTO> {
   if (!isObj(raw)) return { ok: false, errors: ["Request body must be a JSON object"] };
   const errs: string[] = [];
+  // Phase 1B.1 (D3): asOf is optional and untrusted. Expiry and safety are decided on SERVER time.
   const asOf = optionalTimestamp(raw, "asOf", errs);
-  if (asOf === undefined && errs.length === 0) errs.push("asOf is required");
   const completedSessions = num(raw, "completedSessions", errs, { min: 0, integer: true });
-  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, false);
+  const quotes = parseLegQuotes(raw["quotes"], "quotes", errs, false, true); // Phase 1B.2 (A2): keep entry times
   const exitCosts = num(raw, "exitCosts", errs, { min: 0 });
-  if (errs.length > 0 || asOf === undefined) return { ok: false, errors: errs };
-  return { ok: true, value: { asOf, completedSessions, quotes, exitCosts } };
+  if (errs.length > 0) return { ok: false, errors: errs };
+  return { ok: true, value: { ...(asOf ? { asOf } : {}), completedSessions, quotes, exitCosts } };
 }
 
 export type { CandidateInputDTO };

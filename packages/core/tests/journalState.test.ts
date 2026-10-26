@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryJournalRepository, JournalRepositoryError, JournalState, emptyJournalState, validateJournalState } from "../src/index.js";
 import type { JournalStateData, NewJournalEvent, PaperTradeRecord } from "../src/index.js";
-import { exitQuotes, longVolRaw, makeService } from "./fixtures.js";
+import { confirmBody, atEntryTime, exitQuotes, longVolRaw, makeService } from "./fixtures.js";
 
 /** A real PAPER_REVIEW record, produced by the service, to feed the journal rules directly. */
 async function sampleTrade(over: Record<string, unknown> = {}): Promise<PaperTradeRecord> {
@@ -50,7 +50,7 @@ describe("journal: create and retrieve", () => {
     const svc = makeService();
     const r = await svc.service.beginReview(longVolRaw());
     if (!r.ok) throw new Error("x");
-    const c = await svc.service.confirm(r.value.tradeId, { confirmed: true });
+    const c = await svc.service.confirm(r.value.tradeId, confirmBody(svc));
     if (!c.ok) throw new Error("y");
     const withEntry = JSON.parse(JSON.stringify({ ...c.value, state: "PAPER_REVIEW" })) as PaperTradeRecord;
     raises(() => new JournalState().createTrade(withEntry, ev(withEntry.tradeId)), "INVALID_RECORD");
@@ -68,7 +68,7 @@ describe("journal: update lifecycle and append events", () => {
     s.createTrade(t, ev(t.tradeId));
     const svc = makeService();
     const r = await svc.service.beginReview(longVolRaw());
-    const c = r.ok ? await svc.service.confirm(r.value.tradeId, { confirmed: true }) : null;
+    const c = r.ok ? await svc.service.confirm(r.value.tradeId, confirmBody(svc)) : null;
     const entry = c && c.ok ? c.value.entry : null;
     if (!entry) throw new Error("no entry");
     const updated = s.updateLifecycle(t.tradeId, { updatedAt: "t2", state: "PAPER_OPEN", entry }, openedEvent(t.tradeId));
@@ -90,7 +90,7 @@ describe("journal: update lifecycle and append events", () => {
     s.createTrade(t, ev(t.tradeId));
     const svc = makeService();
     const r = await svc.service.beginReview(longVolRaw());
-    const c = r.ok ? await svc.service.confirm(r.value.tradeId, { confirmed: true }) : null;
+    const c = r.ok ? await svc.service.confirm(r.value.tradeId, confirmBody(svc)) : null;
     const entry = c && c.ok ? c.value.entry : null;
     if (!entry) throw new Error("no entry");
     raises(() => s.updateLifecycle(t.tradeId, { updatedAt: "t2", entry }, openedEvent(t.tradeId)), "INVALID_RECORD");
@@ -99,8 +99,8 @@ describe("journal: update lifecycle and append events", () => {
     const svc = makeService();
     const r = await svc.service.beginReview(longVolRaw());
     if (!r.ok) throw new Error("x");
-    await svc.service.confirm(r.value.tradeId, { confirmed: true });
-    await svc.service.exit(r.value.tradeId, exitQuotes());
+    await svc.service.confirm(r.value.tradeId, confirmBody(svc));
+    await svc.service.exit(r.value.tradeId, atEntryTime(exitQuotes(), svc.clock.peek()));
     await expect(svc.repository.updateLifecycle(r.value.tradeId, { updatedAt: "z" }, { timestamp: "z", type: "MONITOR_SNAPSHOT", tradeId: r.value.tradeId, fromState: "PAPER_EXITED", toState: "PAPER_EXITED" })).rejects.toMatchObject({ code: "INVALID_TRANSITION" });
   });
   it("updating an unknown trade is TRADE_NOT_FOUND", () => {
